@@ -1,16 +1,16 @@
 use crate::error::KernelError;
 use crate::kernel::ZcastKernel;
-use axum::extract::{Path, Query, State};
+use axum::extract::{Form, Path, Query, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{Html as AxumHtml, IntoResponse, Redirect, Response};
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tower_http::trace::TraceLayer;
 use zcast_interfaces::{
     Asset, BreadcrumbItem, CardView, NoteId, NoteListFilter, NoteSort, PageContext, ReadContext,
-    StorageError,
+    SearchCapabilities, SearchHit, SearchQuery, StorageError,
 };
 
 pub fn router(kernel: Arc<ZcastKernel>) -> Router {
@@ -19,7 +19,12 @@ pub fn router(kernel: Arc<ZcastKernel>) -> Router {
         .route("/_zcast/modules", get(list_modules))
         .route("/_zcast/theme/{*path}", get(theme_asset))
         .route("/_zcast/editor/{*path}", get(editor_asset))
+        .route("/_zcast/ext/{prefix}/{*path}", get(extension_asset))
         .route("/_zcast/custom.css", get(custom_css))
+        .route("/_zcast/login", get(login_page).post(login_submit))
+        .route("/_zcast/logout", post(logout_submit))
+        .route("/_zcast/popover/{slug}", get(get_popover))
+        .route("/_zcast/search", get(search_notes))
         .route("/_zcast/cards/{slug}", get(get_card_fragment))
         .route("/_zcast/api/notes", get(list_notes_api).post(create_note_api))
         .route(
@@ -35,6 +40,27 @@ pub fn router(kernel: Arc<ZcastKernel>) -> Router {
 #[derive(Debug, Default, Deserialize)]
 struct PageQuery {
     stack: Option<String>,
+    preview: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct LoginQuery {
+    next: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct LoginForm {
+    username: String,
+    password: String,
+    #[serde(default)]
+    next: String,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct SearchParams {
+    q: Option<String>,
+    limit: Option<usize>,
+    context: Option<String>,
     preview: Option<String>,
 }
 
@@ -56,6 +82,23 @@ struct CardFragmentResponse {
     card: CardView,
     html: String,
     canonical_slug: String,
+}
+
+#[derive(Debug, Serialize)]
+struct PopoverResponse {
+    slug: String,
+    canonical_slug: String,
+    title: String,
+    excerpt_html: String,
+    backlink_count: usize,
+    updated_at: chrono::DateTime<chrono::Utc>,
+}
+
+#[derive(Debug, Serialize)]
+struct SearchResponse {
+    query: String,
+    capabilities: SearchCapabilities,
+    hits: Vec<SearchHit>,
 }
 
 #[derive(Debug, Serialize)]
@@ -155,6 +198,344 @@ async fn editor_asset(
 ) -> Response {
     let asset = kernel.editor.as_ref().and_then(|e| e.get_asset(&path));
     asset_response(asset)
+}
+
+async fn extension_asset(
+    State(kernel): State<Arc<ZcastKernel>>,
+    Path((prefix, path)): Path<(String, String)>,
+) -> Response {
+    asset_response(kernel.get_extension_asset(&prefix, &path))
+}
+
+fn sanitize_redirect_path(next: &str) -> &str {
+    let candidate = next.trim();
+    if !candidate.starts_with('/')
+        || candidate.starts_with("//")
+        || candidate.contains('\r')
+        || candidate.contains('\n')
+        || candidate.contains('\\')
+    {
+        return "/";
+    }
+    candidate
+}
+
+fn request_is_https(headers: &HeaderMap) -> bool {
+    headers
+        .get("x-forwarded-proto")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|proto| {
+            proto
+                .split(',')
+                .next()
+                .is_some_and(|first| first.trim().eq_ignore_ascii_case("https"))
+        })
+}
+
+async fn login_page(
+    State(kernel): State<Arc<ZcastKernel>>,
+    headers: HeaderMap,
+    Query(query): Query<LoginQuery>,
+) -> Response {
+    let Some(auth) = &kernel.auth else {
+        return Redirect::to("/").into_response();
+    };
+    let next = sanitize_redirect_path(query.next.as_deref().unwrap_or("/"));
+    if resolve_is_admin(&kernel, &headers, None).await {
+        return Redirect::to(next).into_response();
+    }
+    let html = auth.render_login_page(
+        &kernel.config.site_title,
+        kernel.config.color_mode,
+        None,
+        next,
+    );
+    (
+        [(header::CACHE_CONTROL, HeaderValue::from_static("no-store"))],
+        AxumHtml(html.into_string()),
+    )
+        .into_response()
+}
+
+async fn login_submit(
+    State(kernel): State<Arc<ZcastKernel>>,
+    headers: HeaderMap,
+    Form(form): Form<LoginForm>,
+) -> Response {
+    let Some(auth) = &kernel.auth else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let next = sanitize_redirect_path(&form.next);
+
+    match auth.authenticate(&form.username, &form.password).await {
+        Ok(Some(token)) => {
+            let secure = if request_is_https(&headers) {
+                "; Secure"
+            } else {
+                ""
+            };
+            let cookie = format!(
+                "{}={}; HttpOnly; SameSite=Lax; Path=/; Max-Age={}{}",
+                auth.session_cookie_name(),
+                token,
+                auth.session_ttl_seconds(),
+                secure
+            );
+            let mut resp = Redirect::to(next).into_response();
+            if let Ok(val) = HeaderValue::from_str(&cookie) {
+                resp.headers_mut().insert(header::SET_COOKIE, val);
+            }
+            resp
+        }
+        Ok(None) => {
+            let html = auth.render_login_page(
+                &kernel.config.site_title,
+                kernel.config.color_mode,
+                Some("Invalid username or password."),
+                next,
+            );
+            (
+                StatusCode::UNAUTHORIZED,
+                [(header::CACHE_CONTROL, HeaderValue::from_static("no-store"))],
+                AxumHtml(html.into_string()),
+            )
+                .into_response()
+        }
+        Err(e) => {
+            let html = auth.render_login_page(
+                &kernel.config.site_title,
+                kernel.config.color_mode,
+                Some(&format!("Sign-in failed: {e}")),
+                next,
+            );
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                [(header::CACHE_CONTROL, HeaderValue::from_static("no-store"))],
+                AxumHtml(html.into_string()),
+            )
+                .into_response()
+        }
+    }
+}
+
+async fn logout_submit(
+    State(kernel): State<Arc<ZcastKernel>>,
+    headers: HeaderMap,
+) -> Response {
+    let Some(auth) = &kernel.auth else {
+        return Redirect::to("/").into_response();
+    };
+    if let Some(token) = extract_cookie(&headers, auth.session_cookie_name()) {
+        let _ = auth.revoke_session(&token).await;
+    }
+    let secure = if request_is_https(&headers) {
+        "; Secure"
+    } else {
+        ""
+    };
+    let clear = format!(
+        "{}=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0{}",
+        auth.session_cookie_name(),
+        secure
+    );
+    let mut resp = Redirect::to("/").into_response();
+    if let Ok(val) = HeaderValue::from_str(&clear) {
+        resp.headers_mut().insert(header::SET_COOKIE, val);
+    }
+    resp
+}
+
+async fn get_popover(
+    State(kernel): State<Arc<ZcastKernel>>,
+    Path(slug): Path<String>,
+    headers: HeaderMap,
+    Query(query): Query<PageQuery>,
+) -> Result<impl IntoResponse, ApiError> {
+    let is_admin = resolve_is_admin(&kernel, &headers, query.preview.as_deref()).await;
+    let ctx = ReadContext {
+        include_private: is_admin,
+    };
+
+    let found = kernel
+        .storage
+        .get_note_by_slug_or_alias(&slug, ctx)
+        .await
+        .map_err(KernelError::from)?
+        .ok_or(ApiError(KernelError::NotFound(slug)))?;
+
+    let card = kernel.build_card_view(&found.note, ctx).await?;
+    let excerpt_html = build_popover_excerpt_html(&card.rendered_html, 280);
+
+    Ok((
+        [(header::CACHE_CONTROL, HeaderValue::from_static("no-store"))],
+        Json(PopoverResponse {
+            slug: card.slug.clone(),
+            canonical_slug: card.slug,
+            title: card.title,
+            excerpt_html,
+            backlink_count: card.backlinks.len(),
+            updated_at: card.updated_at,
+        }),
+    ))
+}
+
+async fn search_notes(
+    State(kernel): State<Arc<ZcastKernel>>,
+    headers: HeaderMap,
+    Query(params): Query<SearchParams>,
+) -> Result<impl IntoResponse, ApiError> {
+    let Some(search) = &kernel.search else {
+        return Err(ApiError(KernelError::NotFound(
+            "no search provider is bound".into(),
+        )));
+    };
+
+    let is_admin = resolve_is_admin(&kernel, &headers, params.preview.as_deref()).await;
+    let ctx = ReadContext {
+        include_private: is_admin,
+    };
+
+    let text = params.q.unwrap_or_default();
+    let limit = params.limit.unwrap_or(12).min(50);
+    let context_note_id = params
+        .context
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(NoteId::from);
+
+    let query = SearchQuery {
+        text: text.clone(),
+        limit,
+        context_note_id,
+    };
+    let hits = search
+        .search(&query, ctx)
+        .await
+        .map_err(KernelError::from)?;
+
+    Ok((
+        [(header::CACHE_CONTROL, HeaderValue::from_static("no-store"))],
+        Json(SearchResponse {
+            query: text,
+            capabilities: search.capabilities(),
+            hits,
+        }),
+    ))
+}
+
+/// Produce a clean, tag-balanced HTML excerpt from already-sanitized card HTML.
+fn build_popover_excerpt_html(rendered_html: &str, max_chars: usize) -> String {
+    if rendered_html.is_empty() || max_chars == 0 {
+        return String::new();
+    }
+
+    let mut out = String::with_capacity(rendered_html.len().min(max_chars + 64));
+    let mut stack: Vec<String> = Vec::new();
+    let mut skip_heading: Option<String> = None;
+    let mut visible = 0usize;
+    let mut truncated = false;
+    let bytes = rendered_html.as_bytes();
+    let mut i = 0usize;
+
+    while i < bytes.len() {
+        if bytes[i] == b'<' {
+            let Some(end_rel) = rendered_html[i..].find('>') else {
+                break;
+            };
+            let end = i + end_rel;
+            let raw = &rendered_html[i..=end];
+            let inner = rendered_html[i + 1..end].trim();
+
+            if let Some(closing) = inner.strip_prefix('/') {
+                let name = closing
+                    .split_whitespace()
+                    .next()
+                    .unwrap_or("")
+                    .to_ascii_lowercase();
+                if skip_heading.as_deref() == Some(name.as_str()) {
+                    skip_heading = None;
+                } else if skip_heading.is_none()
+                    && let Some(pos) = stack.iter().rposition(|open| open == &name)
+                {
+                    while stack.len() > pos {
+                        let open = stack.pop().unwrap();
+                        out.push_str("</");
+                        out.push_str(&open);
+                        out.push('>');
+                    }
+                }
+            } else if !inner.starts_with('!') && !inner.starts_with('?') {
+                let self_closing = inner.ends_with('/');
+                let name = inner
+                    .trim_end_matches('/')
+                    .split(|c: char| c.is_whitespace() || c == '/')
+                    .next()
+                    .unwrap_or("")
+                    .to_ascii_lowercase();
+                if matches!(name.as_str(), "h1" | "h2" | "h3" | "h4" | "h5" | "h6") {
+                    skip_heading = Some(name);
+                } else if skip_heading.is_none() && !name.is_empty() {
+                    out.push_str(raw);
+                    let is_void = matches!(
+                        name.as_str(),
+                        "br" | "hr" | "img" | "input" | "meta" | "link" | "area" | "base" | "col"
+                            | "embed" | "param" | "source" | "track" | "wbr"
+                    );
+                    if !self_closing && !is_void {
+                        stack.push(name);
+                    }
+                }
+            }
+
+            i = end + 1;
+            continue;
+        }
+
+        if skip_heading.is_some() {
+            i += rendered_html[i..].chars().next().map_or(1, char::len_utf8);
+            continue;
+        }
+
+        if visible >= max_chars {
+            truncated = true;
+            break;
+        }
+
+        // Preserve HTML entities (`&amp;`, `&#39;`, etc.) as single visible characters.
+        if bytes[i] == b'&'
+            && let Some(semi_rel) = rendered_html[i..].find(';')
+            && semi_rel > 1
+            && semi_rel <= 10
+            && rendered_html[i + 1..i + semi_rel]
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '#')
+        {
+            out.push_str(&rendered_html[i..=i + semi_rel]);
+            visible += 1;
+            i += semi_rel + 1;
+            continue;
+        }
+
+        let ch = rendered_html[i..].chars().next().unwrap();
+        out.push(ch);
+        visible += 1;
+        i += ch.len_utf8();
+    }
+
+    if truncated {
+        let trimmed_len = out.trim_end().len();
+        out.truncate(trimmed_len);
+        out.push('…');
+    }
+
+    while let Some(open) = stack.pop() {
+        out.push_str("</");
+        out.push_str(&open);
+        out.push('>');
+    }
+
+    out
 }
 
 async fn custom_css(State(kernel): State<Arc<ZcastKernel>>) -> Response {

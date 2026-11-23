@@ -85,6 +85,22 @@ impl ModuleRegistry {
         }
     }
 
+    pub fn has_binding(&self, interface: &str) -> bool {
+        self.bindings.iter().any(|b| b.interface == interface)
+    }
+
+    /// Verify that every registered module's required (non-optional) interfaces are bound.
+    pub fn validate_dependencies(&self) -> Result<(), (&'static str, &'static str)> {
+        for module in &self.modules {
+            for req in module.requires {
+                if !req.optional && !self.has_binding(req.name) {
+                    return Err((module.id, req.name));
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub fn snapshot(&self) -> RegistrySnapshot {
         RegistrySnapshot {
             modules: self.modules.clone(),

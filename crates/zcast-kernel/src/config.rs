@@ -14,6 +14,12 @@ pub struct KernelConfig {
     pub pinned_home_slug: String,
     pub custom_css_path: Option<PathBuf>,
     pub allow_unauthenticated_public: bool,
+    /// Optional auth provider (`none` or `basic`).
+    pub auth: Option<String>,
+    /// Admin username for `basic` auth (default: `"admin"`).
+    pub admin_user: String,
+    /// Optional admin password for `basic` auth (set via `ZCAST_ADMIN_PASSWORD` or CLI).
+    pub admin_password: Option<String>,
 }
 
 impl Default for KernelConfig {
@@ -26,6 +32,9 @@ impl Default for KernelConfig {
             pinned_home_slug: "index".to_owned(),
             custom_css_path: None,
             allow_unauthenticated_public: false,
+            auth: None,
+            admin_user: "admin".to_owned(),
+            admin_password: None,
         }
     }
 }
@@ -76,6 +85,21 @@ impl KernelConfig {
             && !v.trim().is_empty()
         {
             cfg.custom_css_path = Some(PathBuf::from(v));
+        }
+        if let Ok(v) = std::env::var("ZCAST_AUTH")
+            && !v.trim().is_empty()
+        {
+            cfg.auth = Some(v.trim().to_ascii_lowercase());
+        }
+        if let Ok(v) = std::env::var("ZCAST_ADMIN_USER")
+            && !v.trim().is_empty()
+        {
+            cfg.admin_user = v.trim().to_owned();
+        }
+        if let Ok(v) = std::env::var("ZCAST_ADMIN_PASSWORD")
+            && !v.is_empty()
+        {
+            cfg.admin_password = Some(v);
         }
 
         Ok(cfg)

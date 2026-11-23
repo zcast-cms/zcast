@@ -1311,6 +1311,21 @@ async function performSave(state) {
   }
 
   void refreshOpenPanes(state.card);
+
+  try {
+    document.dispatchEvent(
+      new CustomEvent('zcast:note-saved', {
+        detail: {
+          note: state.note,
+          renamed,
+          previousSlug,
+        },
+      }),
+    );
+  } catch {
+    // Ignore if CustomEvent is unavailable.
+  }
+
   return true;
 }
 
@@ -2600,6 +2615,13 @@ function init() {
   hydrateCardToolbars();
   syncDraftActiveState();
   observeDraftPanes();
+
+  document.addEventListener('zcast:open-draft', (event) => {
+    const title = normaliseTitle(event?.detail?.title || '');
+    const anchor = event?.detail?.anchor || null;
+    if (title) void openDraftForTitle(title, anchor);
+    else void openDraftPane('', anchor);
+  });
 
   document.addEventListener('click', handleDocumentClick, true);
   document.addEventListener('input', handleDocumentInput);

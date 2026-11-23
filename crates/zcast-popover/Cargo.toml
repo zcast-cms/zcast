@@ -1,0 +1,11 @@
+[package]
+name = "zcast-popover"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Hover link preview popover UI module for zcast"
+
+[dependencies]
+maud.workspace = true
+rust-embed.workspace = true
+zcast-interfaces.workspace = true

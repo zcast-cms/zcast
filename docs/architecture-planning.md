@@ -179,12 +179,13 @@ dwh-zettelkasten/
    - `zcast-links-wikilink` (`[[link]]` parsing, unresolved/private hiding, backlinks, rename rewriter).
    - `zcast-theme-davidhewitson` (`Maud` SSR templates, light/dark `--zcast-*` tokens matched to `davidhewitson.co.uk`, pinned Index homepage, URL-synced sliding panes, breadcrumbs, optional `custom.css`).
    - `zcast-editor-inline` (pre-bundled ProseMirror/TipTap floating toolbar, strict Markdown + `<u>` + `[[wikilink]]` round-trip, debounced autosave + `Cmd+S`, right-hand stub pane creation).
-2. **`v0.2` — Reader/Discovery Modules (Validates Pure Slot Extensibility):**
+2. **`v0.2` — Reader/Discovery Modules & Basic Production Auth (Validates Pure Slot Extensibility):**
    - `zcast-popover` (hover preview popovers via `data-zcast-note`).
    - `zcast-search-fts` + `zcast-cmd-k` (instant spotlight command bar).
+   - `zcast-auth-basic` (simple username/password admin login, session cookies, login/logout routes — enables safe public VPS deployment).
+3. **`v0.3` — Magic-Link Auth, Markdown I/O, Semantic Search & MySQL:**
+   - `zcast-auth-magic-link` (POST-confirmed tokens + `zcast auth login-link` SSH recovery).
    - `zcast-io-markdown` (full Markdown directory/zip export & import).
-3. **`v0.3` — Production Auth, Semantic Search & MySQL:**
-   - `zcast-auth-magic-link` (POST-confirmed tokens + `zcast auth login-link` SSH recovery) & `zcast-auth-basic`.
    - `zcast-search-onnx` (local semantic topical search) & `zcast-storage-mysql`.
 4. **`v0.4` — `zcast` Ops, CLI Recompiler & Distribution:**
    - `zcast module list | graph | install | update | remove | bind` shim generator & native rebuilder.

@@ -1,0 +1,357 @@
+/* ==========================================================================
+ * zcast-cmd-k — Cmd+K spotlight command bar
+ *
+ * Every colour, radius, shadow and z-index resolves through the theme's
+ * `--zcast-*` design tokens (DEC-14), so the bar looks native in dark,
+ * light, and auto themes with no per-theme overrides.
+ * ========================================================================== */
+
+/* The overlay is created lazily and toggled with the `hidden` attribute. */
+.zcast-cmdk {
+  position: fixed;
+  inset: 0;
+  z-index: var(--zcast-z-modal);
+  display: flex;
+  align-items: flex-start;
+  justify-content: center;
+  padding: min(14vh, 110px) 1rem 1rem;
+  font-family: var(--zcast-font-body);
+  color: var(--zcast-text);
+}
+
+.zcast-cmdk[hidden] {
+  display: none;
+}
+
+body.zcast-cmdk-open {
+  overflow: hidden;
+}
+
+.zcast-cmdk__backdrop {
+  position: absolute;
+  inset: 0;
+  background: var(--zcast-bg);
+  opacity: 0.72;
+  -webkit-backdrop-filter: blur(4px);
+  backdrop-filter: blur(4px);
+  animation: zcast-cmdk-fade 140ms ease both;
+}
+
+.zcast-cmdk__dialog {
+  position: relative;
+  z-index: 1;
+  display: flex;
+  flex-direction: column;
+  width: 100%;
+  max-width: 560px;
+  max-height: calc(100vh - min(14vh, 110px) - 2rem);
+  overflow: hidden;
+  background: var(--zcast-surface-elevated, var(--zcast-surface));
+  border: 1px solid var(--zcast-border);
+  border-radius: calc(var(--zcast-radius) * 1.5);
+  box-shadow: var(--zcast-shadow-popover);
+  animation: zcast-cmdk-rise 160ms cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+
+/* Search row ------------------------------------------------------------- */
+
+.zcast-cmdk__search {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  padding: 1rem 1.1rem;
+  border-bottom: 1px solid var(--zcast-border);
+}
+
+.zcast-cmdk__search:focus-within {
+  box-shadow: inset 0 -1px 0 var(--zcast-accent);
+}
+
+.zcast-cmdk__icon {
+  display: inline-flex;
+  flex: 0 0 auto;
+  align-items: center;
+  justify-content: center;
+  width: 1.1rem;
+  height: 1.1rem;
+  color: var(--zcast-text-muted);
+}
+
+.zcast-cmdk__icon svg {
+  display: block;
+  width: 100%;
+  height: 100%;
+}
+
+.zcast-cmdk__input {
+  flex: 1 1 auto;
+  min-width: 0;
+  padding: 0.1rem 0;
+  border: 0;
+  outline: 0;
+  background: transparent;
+  color: var(--zcast-text);
+  font: inherit;
+  font-size: 1.05rem;
+  line-height: 1.4;
+}
+
+.zcast-cmdk__input::placeholder {
+  color: var(--zcast-text-muted);
+  opacity: 0.85;
+}
+
+.zcast-cmdk__input::-webkit-search-cancel-button {
+  display: none;
+}
+
+/* Keyboard keycaps ------------------------------------------------------- */
+
+.zcast-cmdk-kbd,
+.zcast-cmdk__esc,
+.zcast-cmdk__footer kbd {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 1.35rem;
+  padding: 0.08rem 0.32rem;
+  border: 1px solid var(--zcast-border);
+  border-radius: calc(var(--zcast-radius) * 0.5);
+  background: var(--zcast-surface);
+  color: var(--zcast-text-muted);
+  font-family: var(--zcast-font-mono);
+  font-size: 0.68rem;
+  font-weight: 500;
+  line-height: 1.25;
+  letter-spacing: 0.02em;
+  white-space: nowrap;
+}
+
+.zcast-cmdk__esc {
+  flex: 0 0 auto;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+
+.zcast-cmdk-trigger {
+  gap: 0.45rem;
+}
+
+.zcast-cmdk-trigger:hover .zcast-cmdk-kbd,
+.zcast-cmdk-trigger:focus-visible .zcast-cmdk-kbd {
+  border-color: var(--zcast-text-muted);
+  color: var(--zcast-text-strong, var(--zcast-text));
+}
+
+/* Results ---------------------------------------------------------------- */
+
+.zcast-cmdk__results {
+  flex: 1 1 auto;
+  min-height: 0;
+  max-height: min(50vh, 420px);
+  overflow-x: hidden;
+  overflow-y: auto;
+  padding: 0.45rem;
+  overscroll-behavior: contain;
+  scrollbar-width: thin;
+  scrollbar-color: var(--zcast-border) transparent;
+}
+
+.zcast-cmdk__results::-webkit-scrollbar {
+  width: 8px;
+}
+
+.zcast-cmdk__results::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.zcast-cmdk__results::-webkit-scrollbar-thumb {
+  background: var(--zcast-border);
+  border: 2px solid transparent;
+  border-radius: 999px;
+  background-clip: padding-box;
+}
+
+.zcast-cmdk__item {
+  position: relative;
+  display: block;
+  width: 100%;
+  padding: 0.65rem 0.85rem;
+  border: 0;
+  border-radius: calc(var(--zcast-radius) * 0.75);
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  text-decoration: none;
+  cursor: pointer;
+}
+
+.zcast-cmdk__item:hover,
+.zcast-cmdk__item[aria-selected="true"] {
+  background: var(--zcast-accent-subtle);
+}
+
+.zcast-cmdk__item[aria-selected="true"]::before {
+  position: absolute;
+  top: 0.55rem;
+  bottom: 0.55rem;
+  left: 0;
+  width: 2px;
+  border-radius: 2px;
+  background: var(--zcast-accent);
+  content: "";
+}
+
+.zcast-cmdk__title {
+  display: block;
+  color: var(--zcast-text-strong, var(--zcast-text));
+  font-family: var(--zcast-font-heading);
+  font-size: 0.98rem;
+  font-weight: 600;
+  line-height: 1.35;
+}
+
+.zcast-cmdk__snippet {
+  display: -webkit-box;
+  margin-top: 0.15rem;
+  overflow: hidden;
+  color: var(--zcast-text-muted);
+  font-size: 0.82rem;
+  line-height: 1.45;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  line-clamp: 2;
+}
+
+.zcast-cmdk__item mark {
+  border-radius: 2px;
+  background: transparent;
+  box-shadow: inset 0 -1px 0 var(--zcast-accent);
+  color: var(--zcast-text-strong, var(--zcast-text));
+  font-weight: 600;
+}
+
+.zcast-cmdk__item--create {
+  margin-top: 0.35rem;
+  border-top: 1px solid var(--zcast-border);
+  border-radius: 0 0 calc(var(--zcast-radius) * 0.75) calc(var(--zcast-radius) * 0.75);
+  color: var(--zcast-text-muted);
+  font-size: 0.86rem;
+}
+
+.zcast-cmdk__item--create:hover,
+.zcast-cmdk__item--create[aria-selected="true"] {
+  color: var(--zcast-text-strong, var(--zcast-text));
+}
+
+/* Empty / loading / error states ----------------------------------------- */
+
+.zcast-cmdk__status {
+  padding: 1.35rem 0.9rem;
+  color: var(--zcast-text-muted);
+  font-size: 0.84rem;
+  line-height: 1.5;
+  text-align: center;
+}
+
+/* Footer hints ----------------------------------------------------------- */
+
+.zcast-cmdk__footer {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 1rem;
+  padding: 0.55rem 0.95rem;
+  border-top: 1px solid var(--zcast-border);
+  color: var(--zcast-text-muted);
+  font-size: 0.7rem;
+  line-height: 1.4;
+}
+
+.zcast-cmdk__hint {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.25rem;
+}
+
+.zcast-cmdk__hint + .zcast-cmdk__hint {
+  margin-left: 0;
+}
+
+.zcast-cmdk__footer kbd {
+  min-width: 1.15rem;
+  padding: 0.05rem 0.24rem;
+  font-size: 0.66rem;
+}
+
+/* Motion ----------------------------------------------------------------- */
+
+@keyframes zcast-cmdk-fade {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 0.72;
+  }
+}
+
+@keyframes zcast-cmdk-rise {
+  from {
+    opacity: 0;
+    transform: translateY(-8px) scale(0.985);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .zcast-cmdk__backdrop,
+  .zcast-cmdk__dialog {
+    animation: none;
+  }
+
+  .zcast-cmdk__item,
+  .zcast-cmdk-kbd {
+    transition: none;
+  }
+}
+
+/* Mobile ----------------------------------------------------------------- */
+
+@media (max-width: 768px) {
+  .zcast-cmdk {
+    padding: 0.75rem;
+  }
+
+  .zcast-cmdk__dialog {
+    max-width: none;
+    max-height: calc(100vh - 1.5rem);
+    border-radius: calc(var(--zcast-radius) * 1.25);
+  }
+
+  .zcast-cmdk__search {
+    gap: 0.6rem;
+    padding: 0.85rem 0.9rem;
+  }
+
+  .zcast-cmdk__input {
+    font-size: 1rem;
+  }
+
+  .zcast-cmdk__results {
+    max-height: calc(100vh - 11rem);
+  }
+
+  .zcast-cmdk__footer {
+    gap: 0.7rem;
+    padding: 0.5rem 0.75rem;
+    font-size: 0.66rem;
+  }
+
+  .zcast-cmdk__item {
+    padding: 0.7rem 0.75rem;
+  }
+}

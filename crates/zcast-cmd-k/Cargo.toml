@@ -1,0 +1,11 @@
+[package]
+name = "zcast-cmd-k"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Floating Cmd+K spotlight command bar UI module for zcast"
+
+[dependencies]
+maud.workspace = true
+rust-embed.workspace = true
+zcast-interfaces.workspace = true

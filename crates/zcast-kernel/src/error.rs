@@ -1,5 +1,5 @@
 use thiserror::Error;
-use zcast_interfaces::{LinkError, StorageError};
+use zcast_interfaces::{AuthError, LinkError, SearchError, StorageError};
 
 #[derive(Debug, Error)]
 pub enum KernelError {
@@ -7,6 +7,15 @@ pub enum KernelError {
     Storage(#[from] StorageError),
     #[error("link parser error: {0}")]
     Links(#[from] LinkError),
+    #[error("auth error: {0}")]
+    Auth(#[from] AuthError),
+    #[error("search error: {0}")]
+    Search(#[from] SearchError),
+    #[error("module '{module}' requires unbound interface '{interface}'")]
+    MissingDependency {
+        module: &'static str,
+        interface: &'static str,
+    },
     #[error("config error: {0}")]
     Config(String),
     #[error("unsafe bind address '{0}' without an active auth module (bind to 127.0.0.1 or pass --allow-unauthenticated-public)")]

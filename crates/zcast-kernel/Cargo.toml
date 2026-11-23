@@ -23,5 +23,9 @@ tracing.workspace = true
 zcast-storage-sqlite.workspace = true
 zcast-links-wikilink.workspace = true
 zcast-editor-inline.workspace = true
+zcast-auth-basic.workspace = true
+zcast-popover.workspace = true
+zcast-search-fts.workspace = true
+zcast-cmd-k.workspace = true
 zcast-theme-davidhewitson.workspace = true
 tower = { version = "0.5", features = ["util"] }

@@ -4,12 +4,16 @@ members = [
     "crates/zcast-storage-sqlite",
     "crates/zcast-links-wikilink",
     "crates/zcast-editor-inline",
+    "crates/zcast-auth-basic",
+    "crates/zcast-popover",
+    "crates/zcast-search-fts",
+    "crates/zcast-cmd-k",
     "crates/zcast-kernel",
     "crates/zcast-cli",
 ]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 license = "MIT"
 repository = "https://github.com/zcast-cms/zcast"
@@ -20,19 +24,27 @@ zcast-theme-davidhewitson = { git = "https://github.com/zcast-cms/zcast-theme-da
 zcast-storage-sqlite = { path = "crates/zcast-storage-sqlite" }
 zcast-links-wikilink = { path = "crates/zcast-links-wikilink" }
 zcast-editor-inline = { path = "crates/zcast-editor-inline" }
+zcast-auth-basic = { path = "crates/zcast-auth-basic" }
+zcast-popover = { path = "crates/zcast-popover" }
+zcast-search-fts = { path = "crates/zcast-search-fts" }
+zcast-cmd-k = { path = "crates/zcast-cmd-k" }
 zcast-kernel = { path = "crates/zcast-kernel" }
 
 ammonia = "4"
+argon2 = "0.5"
 async-trait = "0.1"
 axum = "0.8"
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive"] }
 dashmap = "6"
+hex = "0.4"
 maud = "0.27"
 pulldown-cmark = "0.13"
-rust-embed = "8"
+rand = "0.8"
+rust-embed = { version = "8", features = ["debug-embed"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sha2 = "0.10"
 sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite", "chrono"] }
 thiserror = "2"
 tokio = { version = "1", features = ["full"] }

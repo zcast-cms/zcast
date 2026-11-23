@@ -1,11 +1,15 @@
 use axum::body::Body;
-use axum::http::{Request, StatusCode};
+use axum::http::{Request, StatusCode, header};
 use std::sync::Arc;
 use tower::ServiceExt;
+use zcast_auth_basic::BasicAuthProvider;
+use zcast_cmd_k::CommandBar;
 use zcast_editor_inline::InlineEditor;
-use zcast_interfaces::{Note, ReadContext, ThemeColorMode};
-use zcast_kernel::{KernelConfig, ZcastKernelBuilder};
+use zcast_interfaces::{IFACE_SEARCH, Note, ReadContext, ThemeColorMode};
+use zcast_kernel::{KernelConfig, KernelError, ZcastKernelBuilder};
 use zcast_links_wikilink::WikilinkParser;
+use zcast_popover::HoverPopover;
+use zcast_search_fts::FtsSearchProvider;
 use zcast_storage_sqlite::SqliteStorage;
 use zcast_theme_davidhewitson::DavidHewitsonTheme;
 
@@ -761,4 +765,477 @@ async fn deleting_citing_note_removes_it_from_backlinks_immediately() {
         !html.contains(r#"data-zcast-note="doomed-referrer""#),
         "deleted note must vanish from rendered Linked from HTML: {html}"
     );
+}
+
+/* ========================================================================== */
+/* v0.2 Module Integration Tests (Auth Basic, Popover, Search FTS, Cmd+K)     */
+/* ========================================================================== */
+
+async fn full_v02_kernel(
+    with_auth: bool,
+) -> (Arc<zcast_kernel::ZcastKernel>, Option<Arc<BasicAuthProvider>>) {
+    let storage = Arc::new(SqliteStorage::connect("sqlite::memory:").await.unwrap());
+    let links = Arc::new(WikilinkParser::new());
+    let theme = Arc::new(DavidHewitsonTheme::new());
+    let editor = Arc::new(InlineEditor::new());
+    let search = Arc::new(FtsSearchProvider::new());
+    let popover = Arc::new(HoverPopover::new());
+    let cmd_k = Arc::new(CommandBar::new());
+
+    let config = KernelConfig {
+        site_title: "David's Notes".into(),
+        color_mode: ThemeColorMode::Dark,
+        ..Default::default()
+    };
+
+    let mut builder = ZcastKernelBuilder::new(config, storage.clone(), links, theme)
+        .with_editor(editor)
+        .with_search(search)
+        .with_ui_extension(popover)
+        .with_ui_extension(cmd_k);
+
+    let auth = if with_auth {
+        let provider = Arc::new(BasicAuthProvider::new(storage));
+        builder = builder.with_auth(provider.clone());
+        Some(provider)
+    } else {
+        None
+    };
+
+    let kernel = builder.build().await.unwrap();
+    if let Some(provider) = &auth {
+        provider
+            .ensure_admin_credentials("admin", Some("s3cr3t-pass"))
+            .await
+            .unwrap();
+    }
+    (kernel, auth)
+}
+
+#[tokio::test]
+async fn cmd_k_requires_search_provider_at_kernel_build() {
+    let storage = Arc::new(SqliteStorage::connect("sqlite::memory:").await.unwrap());
+    let links = Arc::new(WikilinkParser::new());
+    let theme = Arc::new(DavidHewitsonTheme::new());
+    let cmd_k = Arc::new(CommandBar::new());
+
+    let err = match ZcastKernelBuilder::new(KernelConfig::default(), storage, links, theme)
+        .with_ui_extension(cmd_k)
+        .build()
+        .await
+    {
+        Ok(_) => panic!("building zcast-cmd-k without a SearchProvider must fail"),
+        Err(err) => err,
+    };
+
+    assert!(
+        matches!(
+            err,
+            KernelError::MissingDependency {
+                module: "zcast-cmd-k",
+                interface,
+            } if interface == IFACE_SEARCH
+        ),
+        "unexpected error: {err:?}"
+    );
+}
+
+#[tokio::test]
+async fn popover_extension_assets_slots_and_privacy_gate_work_end_to_end() {
+    let (kernel, _) = full_v02_kernel(false).await;
+    let app = zcast_kernel::http::router(kernel);
+
+    // Home page embeds popover CSS + JS for both public preview and admin.
+    let home_resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/?preview=public")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(home_resp.status(), StatusCode::OK);
+    let home_html = String::from_utf8(
+        axum::body::to_bytes(home_resp.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(home_html.contains("/_zcast/ext/popover/popover.css"));
+    assert!(home_html.contains("/_zcast/ext/popover/popover.js"));
+
+    // Extension assets are served with proper status and MIME types.
+    for (uri, expected_ct) in [
+        ("/_zcast/ext/popover/popover.css", "text/css"),
+        ("/_zcast/ext/popover/popover.js", "application/javascript"),
+    ] {
+        let resp = app
+            .clone()
+            .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "asset {uri}");
+        assert!(
+            resp.headers()
+                .get(header::CONTENT_TYPE)
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .contains(expected_ct)
+        );
+    }
+
+    // Popover endpoint returns balanced excerpt + backlink count + no-store.
+    let pop_resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/_zcast/popover/how-sliding-panes-work?preview=public")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(pop_resp.status(), StatusCode::OK);
+    assert_eq!(
+        pop_resp.headers().get(header::CACHE_CONTROL).unwrap(),
+        "no-store"
+    );
+    let pop_json: serde_json::Value = serde_json::from_slice(
+        &axum::body::to_bytes(pop_resp.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(pop_json["canonical_slug"], "how-sliding-panes-work");
+    assert_eq!(pop_json["title"], "How Sliding Panes Work");
+    assert!(!pop_json["excerpt_html"].as_str().unwrap().is_empty());
+    assert!(pop_json["backlink_count"].as_u64().unwrap() >= 1);
+
+    // Private note popover MUST return 404 in public preview, 200 in admin mode.
+    let priv_pub = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/_zcast/popover/private-scratchpad?preview=public")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(priv_pub.status(), StatusCode::NOT_FOUND);
+
+    let priv_admin = app
+        .oneshot(
+            Request::builder()
+                .uri("/_zcast/popover/private-scratchpad")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(priv_admin.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn search_fts_and_cmd_k_sync_live_and_respect_privacy() {
+    let (kernel, _) = full_v02_kernel(false).await;
+    let app = zcast_kernel::http::router(kernel);
+
+    // Home page includes Cmd+K trigger, CSS, and JS.
+    let page_resp = app
+        .clone()
+        .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let page_html = String::from_utf8(
+        axum::body::to_bytes(page_resp.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(page_html.contains("data-zcast-cmdk-open"));
+    assert!(page_html.contains("/_zcast/ext/cmd-k/cmd-k.css"));
+    assert!(page_html.contains("/_zcast/ext/cmd-k/cmd-k.js"));
+
+    // Extension assets served.
+    for uri in ["/_zcast/ext/cmd-k/cmd-k.css", "/_zcast/ext/cmd-k/cmd-k.js"] {
+        let resp = app
+            .clone()
+            .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    // Instant prefix query finds seeded card with no-store header.
+    let search_resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/_zcast/search?q=slid&preview=public")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(search_resp.status(), StatusCode::OK);
+    assert_eq!(
+        search_resp.headers().get(header::CACHE_CONTROL).unwrap(),
+        "no-store"
+    );
+    let data: serde_json::Value = serde_json::from_slice(
+        &axum::body::to_bytes(search_resp.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(data["hits"][0]["slug"], "how-sliding-panes-work");
+
+    // Private note never appears in public search, appears in admin search.
+    let (_, priv_pub) = send(
+        &app,
+        Request::builder()
+            .uri("/_zcast/search?q=scratchpad&preview=public")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(priv_pub["hits"].as_array().unwrap().len(), 0);
+
+    let (_, priv_admin) = send(
+        &app,
+        Request::builder()
+            .uri("/_zcast/search?q=scratchpad")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(priv_admin["hits"][0]["slug"], "private-scratchpad");
+
+    // Creating, renaming, and deleting a note updates search live.
+    let (status, created) = send(
+        &app,
+        json_request(
+            "POST",
+            "/_zcast/api/notes",
+            serde_json::json!({
+                "title": "Kestrel Observation",
+                "markdown_body": "Hovering calmly over the ridge.",
+                "private": false
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let note_id = created["note"]["id"].as_str().unwrap().to_owned();
+
+    let (_, found) = send(
+        &app,
+        Request::builder()
+            .uri("/_zcast/search?q=kestrel&preview=public")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(found["hits"][0]["slug"], "kestrel-observation");
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri(format!("/_zcast/api/notes/{note_id}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+    let (_, after_del) = send(
+        &app,
+        Request::builder()
+            .uri("/_zcast/search?q=kestrel&preview=public")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(after_del["hits"].as_array().unwrap().len(), 0);
+}
+
+#[tokio::test]
+async fn basic_auth_protects_admin_routes_and_handles_login_logout_flow() {
+    let (kernel, _) = full_v02_kernel(true).await;
+    let app = zcast_kernel::http::router(kernel);
+
+    // 1. Unauthenticated visitor sees Sign in, no editor, and cannot write via API.
+    let home = app
+        .clone()
+        .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(home.status(), StatusCode::OK);
+    let html = String::from_utf8(
+        axum::body::to_bytes(home.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(html.contains("data-zcast-login"));
+    assert!(!html.contains("/_zcast/editor/editor.bundle.js"));
+    assert!(!html.contains("data-zcast-new-note"));
+
+    let (write_status, _) = send(
+        &app,
+        json_request(
+            "POST",
+            "/_zcast/api/notes",
+            serde_json::json!({
+                "title": "Blocked Note",
+                "markdown_body": "nope",
+                "private": false
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(write_status, StatusCode::FORBIDDEN);
+
+    // 2. GET /_zcast/login renders login page.
+    let login_get = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/_zcast/login?next=/how-sliding-panes-work")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(login_get.status(), StatusCode::OK);
+
+    // 3. POST /_zcast/login with wrong password returns 401 and no cookie.
+    let bad_login = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/_zcast/login")
+                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .body(Body::from("username=admin&password=wrong&next=/"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(bad_login.status(), StatusCode::UNAUTHORIZED);
+    assert!(bad_login.headers().get(header::SET_COOKIE).is_none());
+
+    // 4. POST /_zcast/login with valid credentials sets HttpOnly cookie and redirects.
+    let ok_login = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/_zcast/login")
+                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .body(Body::from(
+                    "username=admin&password=s3cr3t-pass&next=/how-sliding-panes-work",
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(ok_login.status(), StatusCode::SEE_OTHER);
+    assert_eq!(
+        ok_login.headers().get(header::LOCATION).unwrap(),
+        "/how-sliding-panes-work"
+    );
+    let set_cookie = ok_login
+        .headers()
+        .get(header::SET_COOKIE)
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_owned();
+    assert!(set_cookie.starts_with("zcast_session="));
+    assert!(set_cookie.contains("HttpOnly"));
+    assert!(set_cookie.contains("SameSite=Lax"));
+    let cookie_pair = set_cookie.split(';').next().unwrap().to_owned();
+
+    // 5. Authenticated cookie unlocks editor, Log out button, private notes & API writes.
+    let auth_home = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/")
+                .header(header::COOKIE, &cookie_pair)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let auth_html = String::from_utf8(
+        axum::body::to_bytes(auth_home.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(auth_html.contains("data-zcast-logout"));
+    assert!(auth_html.contains("/_zcast/editor/editor.bundle.js"));
+    assert!(auth_html.contains("data-zcast-new-note"));
+
+    let priv_ok = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/private-scratchpad")
+                .header(header::COOKIE, &cookie_pair)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(priv_ok.status(), StatusCode::OK);
+
+    // 6. POST /_zcast/logout revokes session; replaying old cookie fails immediately.
+    let logout = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/_zcast/logout")
+                .header(header::COOKIE, &cookie_pair)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(logout.status(), StatusCode::SEE_OTHER);
+    assert!(
+        logout
+            .headers()
+            .get(header::SET_COOKIE)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .contains("Max-Age=0")
+    );
+
+    let after_logout = app
+        .oneshot(
+            Request::builder()
+                .uri("/private-scratchpad")
+                .header(header::COOKIE, &cookie_pair)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(after_logout.status(), StatusCode::NOT_FOUND);
 }

@@ -1,0 +1,235 @@
+/*
+ * zcast-popover: hover preview card.
+ *
+ * Every colour/elevation/typography decision comes from the active theme's
+ * --zcast-* design tokens, so the same stylesheet works in dark, light and
+ * auto themes without any per-theme overrides.
+ */
+
+.zcast-popover {
+    position: fixed;
+    top: 0;
+    left: 0;
+    z-index: var(--zcast-z-popover);
+    display: flex;
+    flex-direction: column;
+    width: min(340px, calc(100vw - 16px));
+    max-width: 340px;
+    max-height: min(260px, calc(100vh - 16px));
+    overflow: hidden;
+    background: var(--zcast-surface-elevated, var(--zcast-surface));
+    color: var(--zcast-text);
+    border: 1px solid var(--zcast-border);
+    border-radius: var(--zcast-radius);
+    box-shadow: var(--zcast-shadow-popover);
+    font-family: var(--zcast-font-body);
+    font-size: 0.9375rem;
+    line-height: 1.55;
+    text-align: left;
+    opacity: 0;
+    visibility: hidden;
+    transform: translateY(4px);
+    transition:
+        opacity 140ms ease,
+        transform 140ms ease,
+        visibility 0s linear 140ms;
+    pointer-events: none;
+}
+
+.zcast-popover.is-visible,
+.zcast-popover[data-visible="true"] {
+    opacity: 1;
+    visibility: visible;
+    transform: translateY(0);
+    transition:
+        opacity 140ms ease,
+        transform 140ms ease;
+    pointer-events: auto;
+}
+
+.zcast-popover__header {
+    flex: 0 0 auto;
+    padding: 0.65rem 0.85rem 0.4rem;
+    border-bottom: 1px solid var(--zcast-border);
+}
+
+.zcast-popover__title {
+    display: block;
+    overflow: hidden;
+    color: var(--zcast-text);
+    font-family: var(--zcast-font-heading, var(--zcast-font-body));
+    font-size: 1rem;
+    font-weight: 600;
+    line-height: 1.25;
+    letter-spacing: -0.01em;
+    white-space: nowrap;
+    text-overflow: ellipsis;
+}
+
+.zcast-popover__body-wrap {
+    position: relative;
+    display: flex;
+    flex: 1 1 auto;
+    min-height: 0;
+}
+
+.zcast-popover__body-wrap::after {
+    content: "";
+    position: absolute;
+    right: 0;
+    bottom: 0;
+    left: 0;
+    height: 1.25rem;
+    background: linear-gradient(
+        to bottom,
+        transparent,
+        var(--zcast-surface-elevated, var(--zcast-surface))
+    );
+    pointer-events: none;
+}
+
+.zcast-popover__body {
+    flex: 1 1 auto;
+    min-height: 0;
+    padding: 0.55rem 0.85rem 0.7rem;
+    overflow-x: hidden;
+    overflow-y: auto;
+    overscroll-behavior: contain;
+    color: var(--zcast-text);
+    font-family: var(--zcast-font-body);
+    font-size: 0.9375rem;
+    line-height: 1.55;
+}
+
+.zcast-popover__body > :first-child {
+    margin-top: 0;
+}
+
+.zcast-popover__body > :last-child {
+    margin-bottom: 0;
+}
+
+.zcast-popover__body p {
+    margin: 0 0 0.65em;
+}
+
+.zcast-popover__body h1,
+.zcast-popover__body h2,
+.zcast-popover__body h3,
+.zcast-popover__body h4,
+.zcast-popover__body h5,
+.zcast-popover__body h6 {
+    margin: 0 0 0.45em;
+    color: var(--zcast-text);
+    font-family: var(--zcast-font-heading, var(--zcast-font-body));
+    font-size: 1em;
+    font-weight: 600;
+    line-height: 1.3;
+}
+
+.zcast-popover__body strong,
+.zcast-popover__body b {
+    color: var(--zcast-text);
+    font-weight: 600;
+}
+
+.zcast-popover__body em,
+.zcast-popover__body i {
+    color: var(--zcast-text);
+}
+
+.zcast-popover__body a {
+    color: var(--zcast-accent);
+    text-decoration: none;
+}
+
+.zcast-popover__body a:hover,
+.zcast-popover__body a:focus-visible {
+    text-decoration: underline;
+}
+
+.zcast-popover__body code,
+.zcast-popover__body kbd,
+.zcast-popover__body pre {
+    font-family: var(--zcast-font-mono);
+}
+
+.zcast-popover__body code {
+    padding: 0.05em 0.3em;
+    background: var(--zcast-accent-subtle);
+    border-radius: var(--zcast-radius);
+    font-size: 0.875em;
+}
+
+.zcast-popover__body pre {
+    max-width: 100%;
+    margin: 0 0 0.65em;
+    padding: 0.5rem 0.6rem;
+    overflow-x: auto;
+    background: var(--zcast-accent-subtle);
+    border-radius: var(--zcast-radius);
+    font-size: 0.8125em;
+    line-height: 1.45;
+}
+
+.zcast-popover__body img,
+.zcast-popover__body svg,
+.zcast-popover__body video {
+    max-width: 100%;
+    height: auto;
+}
+
+.zcast-popover__body blockquote {
+    margin: 0 0 0.65em;
+    padding-left: 0.7rem;
+    color: var(--zcast-text-muted);
+    border-left: 2px solid var(--zcast-border);
+}
+
+.zcast-popover__body ul,
+.zcast-popover__body ol {
+    margin: 0 0 0.65em;
+    padding-left: 1.2em;
+}
+
+.zcast-popover__body li + li {
+    margin-top: 0.2em;
+}
+
+.zcast-popover__body hr {
+    margin: 0.7em 0;
+    border: 0;
+    border-top: 1px solid var(--zcast-border);
+}
+
+.zcast-popover__meta {
+    flex: 0 0 auto;
+    padding: 0.35rem 0.85rem 0.5rem;
+    color: var(--zcast-text-muted);
+    border-top: 1px solid var(--zcast-border);
+    font-family: var(--zcast-font-body);
+    font-size: 0.75rem;
+    line-height: 1.3;
+    letter-spacing: 0.01em;
+}
+
+.zcast-popover__meta:empty,
+.zcast-popover__meta[hidden] {
+    display: none;
+}
+
+@media (prefers-reduced-motion: reduce) {
+    .zcast-popover,
+    .zcast-popover.is-visible,
+    .zcast-popover[data-visible="true"] {
+        transition: none;
+        transform: none;
+    }
+}
+
+/* Preview cards are a pointer affordance only: never show them on touch. */
+@media (hover: none), (pointer: coarse) {
+    .zcast-popover {
+        display: none !important;
+    }
+}
