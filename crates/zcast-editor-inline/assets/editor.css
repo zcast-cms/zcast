@@ -82,6 +82,20 @@
   text-underline-offset: 0.2em;
 }
 
+.zcast-save-status[data-state="hint"] {
+  color: var(--zcast-text-muted);
+}
+
+.zcast-btn-discard {
+  border-style: dashed;
+  color: var(--zcast-text-muted);
+}
+
+.zcast-btn-discard:hover {
+  border-style: solid;
+  color: var(--zcast-text);
+}
+
 /* -------------------------------------------------------------------------- */
 /* In-place title + editor surface                                            */
 /* -------------------------------------------------------------------------- */
@@ -437,9 +451,53 @@ a[data-zcast-unresolved] {
   border-style: dashed;
 }
 
+/* Polished slide-in from the right for freshly created draft panes. */
+@keyframes zcast-card-slide-in {
+  from {
+    opacity: 0;
+    transform: translateX(28px);
+  }
+  to {
+    opacity: 1;
+    transform: translateX(0);
+  }
+}
+
+.zcast-card-draft,
+.zcast-card--entering {
+  animation: zcast-card-slide-in 220ms cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+
+/* Fallback pulse when a draft pane is re-targeted instead of duplicated. */
+@keyframes zcast-card-highlight-pulse {
+  from {
+    box-shadow: 0 0 0 3px var(--zcast-accent-subtle);
+  }
+  to {
+    box-shadow: 0 0 0 0 transparent;
+  }
+}
+
+.zcast-card--highlight {
+  animation: zcast-card-highlight-pulse 1.2s ease-out;
+}
+
+/* Mark "+ New Note" while an unsaved draft is already open. */
+[data-zcast-new-note][data-draft-active="true"] {
+  border-color: var(--zcast-accent);
+  color: var(--zcast-text-muted);
+  opacity: 0.75;
+}
+
 @media (prefers-reduced-motion: reduce) {
   .zcast-btn,
   .zcast-toolbar-btn {
     transition: none;
+  }
+
+  .zcast-card-draft,
+  .zcast-card--entering,
+  .zcast-card--highlight {
+    animation: none;
   }
 }

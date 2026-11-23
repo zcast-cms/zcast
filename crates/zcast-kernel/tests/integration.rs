@@ -278,3 +278,187 @@ async fn api_create_and_list_notes_for_autocomplete() {
 
     let _ = Note::new("unused", "", false);
 }
+
+async fn link_edges(
+    kernel: &zcast_kernel::ZcastKernel,
+    note_id: &zcast_interfaces::NoteId,
+) -> Vec<serde_json::Value> {
+    let store = kernel.storage.module_store("zcast-links-wikilink");
+    let value = store
+        .get(&format!("out:{}", note_id.as_str()))
+        .await
+        .expect("read edges");
+    value
+        .map(|v| serde_json::from_value(v).expect("edges json"))
+        .unwrap_or_default()
+}
+
+#[tokio::test]
+async fn slug_based_wikilinks_appear_in_backlinks_and_rewrite_on_rename() {
+    let kernel = test_kernel(ThemeColorMode::Auto).await;
+
+    let panes = kernel
+        .storage
+        .get_note_by_slug_or_alias("how-sliding-panes-work", ReadContext::ADMIN)
+        .await
+        .unwrap()
+        .unwrap()
+        .note;
+
+    let referrer = kernel
+        .create_note(
+            "Slug Referrer".into(),
+            "This note links via [[how-sliding-panes-work]].".into(),
+            false,
+        )
+        .await
+        .unwrap()
+        .note;
+
+    let backlinks = kernel
+        .links
+        .get_backlinks(&panes.id, kernel.storage.as_ref(), ReadContext::ADMIN)
+        .await
+        .unwrap();
+    assert!(
+        backlinks.iter().any(|b| b.note_id == referrer.id),
+        "slug link must appear in backlinks: {backlinks:?}"
+    );
+
+    kernel
+        .update_note(
+            &panes.id,
+            "Sliding Panes Guide".into(),
+            panes.markdown_body.clone(),
+            false,
+        )
+        .await
+        .unwrap();
+
+    let referrer = kernel
+        .storage
+        .get_note_by_id(&referrer.id, ReadContext::ADMIN)
+        .await
+        .unwrap()
+        .expect("referrer present");
+    assert_eq!(
+        referrer.markdown_body,
+        "This note links via [[Sliding Panes Guide]]."
+    );
+
+    let backlinks = kernel
+        .links
+        .get_backlinks(&panes.id, kernel.storage.as_ref(), ReadContext::ADMIN)
+        .await
+        .unwrap();
+    assert!(
+        backlinks.iter().any(|b| b.note_id == referrer.id),
+        "rewritten link must still resolve: {backlinks:?}"
+    );
+}
+
+#[tokio::test]
+async fn failed_rename_leaves_link_edges_untouched() {
+    let kernel = test_kernel(ThemeColorMode::Auto).await;
+
+    let alpha = kernel
+        .create_note("Alpha".into(), "root".into(), false)
+        .await
+        .unwrap()
+        .note;
+    let beta = kernel
+        .create_note("Beta".into(), "See [[Alpha]] for details.".into(), false)
+        .await
+        .unwrap()
+        .note;
+    kernel
+        .create_note("Taken Title".into(), "occupied".into(), false)
+        .await
+        .unwrap();
+
+    // Renaming Alpha onto an existing title must fail. Before the atomic fix this
+    // still synced Beta's edges to "Taken Title", losing the real backlink.
+    let result = kernel
+        .update_note(&alpha.id, "Taken Title".into(), "root".into(), false)
+        .await;
+    assert!(result.is_err(), "conflicting rename must fail");
+
+    let stored = kernel
+        .storage
+        .get_note_by_id(&alpha.id, ReadContext::ADMIN)
+        .await
+        .unwrap()
+        .expect("alpha present");
+    assert_eq!(stored.title, "Alpha");
+
+    let edges = link_edges(&kernel, &beta.id).await;
+    assert!(
+        edges.iter().any(|link| link["target_title"] == "Alpha"),
+        "edges must still point at the old title: {edges:?}"
+    );
+    assert!(
+        edges.iter().all(|link| link["target_title"] != "Taken Title"),
+        "failed rename must not rewrite edges: {edges:?}"
+    );
+
+    let backlinks = kernel
+        .links
+        .get_backlinks(&alpha.id, kernel.storage.as_ref(), ReadContext::ADMIN)
+        .await
+        .unwrap();
+    assert_eq!(backlinks.len(), 1, "{backlinks:?}");
+    assert_eq!(backlinks[0].note_id, beta.id);
+}
+
+#[tokio::test]
+async fn renaming_rewrites_self_links_in_the_renamed_note() {
+    let kernel = test_kernel(ThemeColorMode::Auto).await;
+
+    let old = kernel
+        .create_note(
+            "Old Title".into(),
+            "I refer to myself as [[Old Title]] often.".into(),
+            false,
+        )
+        .await
+        .unwrap()
+        .note;
+
+    let res = kernel
+        .update_note(
+            &old.id,
+            "New Title".into(),
+            "I refer to myself as [[Old Title]] often.".into(),
+            false,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(res.renamed_from_slug.as_deref(), Some("old-title"));
+    assert_eq!(res.note.title, "New Title");
+    assert_eq!(
+        res.note.markdown_body,
+        "I refer to myself as [[New Title]] often."
+    );
+
+    let stored = kernel
+        .storage
+        .get_note_by_id(&old.id, ReadContext::ADMIN)
+        .await
+        .unwrap()
+        .expect("note present");
+    assert_eq!(
+        stored.markdown_body,
+        "I refer to myself as [[New Title]] often."
+    );
+
+    let edges = link_edges(&kernel, &old.id).await;
+    assert!(
+        edges.iter().any(|link| link["target_title"] == "New Title"),
+        "self edge must point at the new title: {edges:?}"
+    );
+    assert!(
+        edges.iter().all(|link| link["target_title"] != "Old Title"),
+        "stale self edge must be gone: {edges:?}"
+    );
+}

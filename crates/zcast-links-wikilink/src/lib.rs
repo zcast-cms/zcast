@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use zcast_interfaces::{
     BacklinkRef, Html, IFACE_LINKS, IFACE_STORAGE, InterfaceReq, InterfaceSpec, LinkError,
     LinkParser, ModuleManifest, Note, NoteId, NoteListFilter, ParsedLink, ReadContext,
-    ResolvedTarget, Storage,
+    ResolvedTarget, Storage, slugify,
 };
 
 /// Module-store namespace holding the link graph edges.
@@ -165,8 +165,18 @@ impl LinkParser for WikilinkParser {
             return Ok(Vec::new());
         };
 
-        let mut target_names: Vec<String> = vec![target.title.to_lowercase()];
-        target_names.extend(target.aliases.iter().map(|a| a.title.to_lowercase()));
+        // Match links by title, slug, or either of those for a historical alias so
+        // that `[[how-sliding-panes-work]]` resolves just like `[[How Sliding Panes Work]]`.
+        let mut target_names: Vec<String> = vec![
+            target.title.to_lowercase(),
+            target.slug.to_lowercase(),
+        ];
+        target_names.extend(
+            target
+                .aliases
+                .iter()
+                .flat_map(|a| [a.title.to_lowercase(), a.slug.to_lowercase()]),
+        );
 
         let store = storage.module_store(NAMESPACE);
         let entries = store.list_prefix(OUT_PREFIX, None).await?;
@@ -228,6 +238,8 @@ impl LinkParser for WikilinkParser {
         let old_title = old_title.trim();
         let new_title = new_title.trim();
         let old_lower = old_title.to_lowercase();
+        // Also rewrite slug-style links (`[[old-slug]]`) to the new title.
+        let old_slug_lower = slugify(old_title);
 
         let notes = storage
             .list_notes(NoteListFilter::default(), ReadContext::ADMIN)
@@ -249,7 +261,8 @@ impl LinkParser for WikilinkParser {
                         display,
                         has_display,
                     } => {
-                        if target.trim().to_lowercase() == old_lower {
+                        let target_lower = target.trim().to_lowercase();
+                        if target_lower == old_lower || target_lower == old_slug_lower {
                             changed = true;
                             if *has_display {
                                 body.push_str("[[");
@@ -272,7 +285,10 @@ impl LinkParser for WikilinkParser {
             if changed {
                 note.markdown_body = body;
                 note.updated_at = Utc::now();
-                self.sync_note_links(&note, storage).await?;
+                // Pure computation: the caller persists these notes atomically
+                // (`Storage::rename_note_atomic`) and only then re-syncs edges.
+                // Writing to `module_kv` here would leave stale graph edges if
+                // the rename later fails on a slug/title conflict.
                 modified.push(note);
             }
         }
@@ -848,6 +864,34 @@ Inline `[[InCode]]` and ``code with [[Tick]]`` then [[Real]].";
     }
 
     #[tokio::test]
+    async fn backlinks_match_slug_and_alias_slug_links() {
+        let storage = storage().await;
+        let parser = WikilinkParser::new();
+
+        let mut panes = save(&storage, "How Sliding Panes Work", "root").await;
+        panes.aliases.push(NoteAlias {
+            slug: "old-panes".into(),
+            title: "Old Panes".into(),
+            created_at: Utc::now(),
+        });
+        storage.save_note(&panes).await.expect("save alias");
+
+        let by_slug = save(&storage, "By Slug", "[[how-sliding-panes-work]]").await;
+        let by_alias_slug = save(&storage, "By Alias Slug", "[[old-panes|panes]]").await;
+        let unrelated = save(&storage, "Unrelated", "[[elsewhere]]").await;
+        for note in [&by_slug, &by_alias_slug, &unrelated] {
+            parser.sync_note_links(note, &storage).await.expect("sync");
+        }
+
+        let backlinks = parser
+            .get_backlinks(&panes.id, &storage, ReadContext::ADMIN)
+            .await
+            .expect("backlinks");
+        let ids: Vec<_> = backlinks.iter().map(|b| b.note_id.clone()).collect();
+        assert_eq!(ids, [by_alias_slug.id, by_slug.id]);
+    }
+
+    #[tokio::test]
     async fn remove_note_links_clears_outgoing_edges() {
         let storage = storage().await;
         let parser = WikilinkParser::new();
@@ -929,7 +973,8 @@ Also [[Alpha Prime]] once more.
         );
         assert!(updated.updated_at >= beta.updated_at);
 
-        // The rewritten body is what the caller will persist via rename_note_atomic.
+        // Rewriting is pure: the stored note and `module_kv` edges are untouched
+        // until the caller commits via `rename_note_atomic` and re-syncs.
         let stored = storage
             .get_note_by_id(&beta.id, ReadContext::ADMIN)
             .await
@@ -944,16 +989,66 @@ Also [[Alpha Prime]] once more.
                 .all(|n| n.id != unrelated.id && n.id != alpha.id)
         );
 
-        // The graph now points at the new title.
+        // Pre-existing edges still point at the old title because nothing was synced.
         let edges = storage
             .module_store(NAMESPACE)
             .get(&out_key(&beta.id))
             .await
-            .expect("get")
-            .expect("edges");
-        let edges: Vec<StoredLink> = serde_json::from_value(edges).expect("edges json");
-        assert!(edges.iter().any(|link| link.target_title == "Alpha Prime"));
-        assert!(edges.iter().all(|link| link.target_title != "Alpha"));
+            .expect("get");
+        assert!(edges.is_none(), "rewrite must not write edges: {edges:?}");
+    }
+
+    #[tokio::test]
+    async fn rewrite_links_for_rename_leaves_existing_edges_untouched() {
+        let storage = storage().await;
+        let parser = WikilinkParser::new();
+
+        save(&storage, "Alpha", "root").await;
+        let beta = save(&storage, "Beta", "[[Alpha]]").await;
+        parser.sync_note_links(&beta, &storage).await.expect("sync");
+
+        let modified = parser
+            .rewrite_links_for_rename("Alpha", "Alpha Prime", &storage)
+            .await
+            .expect("rewrite");
+        assert_eq!(modified.len(), 1);
+
+        let store = storage.module_store(NAMESPACE);
+        let edges: Vec<StoredLink> = serde_json::from_value(
+            store
+                .get(&out_key(&beta.id))
+                .await
+                .expect("get")
+                .expect("edges"),
+        )
+        .expect("edges json");
+        assert_eq!(edges.len(), 1);
+        assert_eq!(edges[0].target_title, "Alpha");
+    }
+
+    #[tokio::test]
+    async fn rewrite_links_for_rename_matches_slug_links() {
+        let storage = storage().await;
+        let parser = WikilinkParser::new();
+
+        save(&storage, "Old Title", "root").await;
+        let beta = save(
+            &storage,
+            "Beta",
+            "[[old-title]] and [[OLD-TITLE|slug display]] and [[Old Title]]",
+        )
+        .await;
+
+        let modified = parser
+            .rewrite_links_for_rename("Old Title", "New Title", &storage)
+            .await
+            .expect("rewrite");
+        assert_eq!(modified.len(), 1);
+        assert_eq!(modified[0].id, beta.id);
+        assert_eq!(
+            modified[0].markdown_body,
+            "[[New Title]] and [[New Title|slug display]] and [[New Title]]"
+        );
     }
 
     #[tokio::test]

@@ -324,16 +324,26 @@ impl ZcastKernel {
                 .links
                 .rewrite_links_for_rename(&old_title, &existing.title, self.storage.as_ref())
                 .await?;
-            // Exclude self from rewritten referrers if self-linked; handle self-link in `existing`
-            let rewritten_others: Vec<Note> = rewritten
-                .into_iter()
-                .filter(|n| n.id != existing.id)
-                .collect();
+
+            // A renamed note may link to itself (`[[Old Title]]` in its own body).
+            // Apply that rewrite to `existing` before the atomic rename so the
+            // self-link is persisted, but keep it out of `rewritten_others` so
+            // the note is not written twice in the same transaction.
+            let mut rewritten_others: Vec<Note> = Vec::with_capacity(rewritten.len());
+            for note in rewritten {
+                if note.id == existing.id {
+                    existing.markdown_body = note.markdown_body;
+                } else {
+                    rewritten_others.push(note);
+                }
+            }
 
             self.storage
                 .rename_note_atomic(&existing, &alias, &rewritten_others)
                 .await?;
 
+            // Only re-sync the graph after the rename committed: rewriting the
+            // edges earlier would leave them stale if the rename conflicts.
             for r in &rewritten_others {
                 self.links.sync_note_links(r, self.storage.as_ref()).await?;
             }

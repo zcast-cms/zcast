@@ -18,6 +18,7 @@ const API_NOTES = '/_zcast/api/notes';
 const SAVE_DELAY_MS = 800;
 const AUTOCOMPLETE_DELAY_MS = 120;
 const SAVED_STATUS_MS = 2200;
+const HINT_STATUS_MS = 3200;
 
 const markdown = new MarkdownIt({
   html: true,
@@ -358,6 +359,183 @@ function cardParts(card) {
   };
 }
 
+function normaliseTitle(value) {
+  return String(value ?? '')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function titleKey(value) {
+  return normaliseTitle(value).toLowerCase();
+}
+
+function normaliseSlug(value) {
+  return String(value ?? '')
+    .replace(/^\/+/, '')
+    .trim();
+}
+
+/** Every unsaved draft pane currently in the DOM, oldest first. */
+function openDraftCards() {
+  return Array.from(
+    document.querySelectorAll('[data-zcast-card][data-zcast-draft="true"]'),
+  ).filter((card) => !cardId(card));
+}
+
+function findOpenDraftCard() {
+  return openDraftCards()[0] || null;
+}
+
+function draftTitle(card) {
+  const state = editorStates.get(card);
+  const element = state?.titleElement || card.querySelector('[data-zcast-card-title]');
+  if (element) return normaliseTitle(element.textContent);
+  return normaliseTitle(state?.note?.title);
+}
+
+/** True when an unsaved draft has neither a title nor any markdown. */
+function draftIsBlank(card) {
+  const state = editorStates.get(card);
+  if (state) return draftIsEmptyState(state);
+
+  const title = normaliseTitle(card.querySelector('[data-zcast-card-title]')?.textContent);
+  const body = normaliseTitle(card.querySelector('[data-zcast-card-body]')?.textContent);
+  return !title && !body;
+}
+
+/** True when an unsaved draft has neither a title nor any markdown. */
+function draftIsEmptyState(state) {
+  if (!state) return false;
+  return (
+    !normaliseTitle(state.titleElement?.textContent) &&
+    !normaliseTitle(readMarkdown(state))
+  );
+}
+
+function syncDraftActiveState() {
+  const active = Boolean(findOpenDraftCard());
+  const root = document.documentElement;
+
+  if (active) root.dataset.zcastDraftActive = 'true';
+  else delete root.dataset.zcastDraftActive;
+
+  document.querySelectorAll('[data-zcast-new-note]').forEach((button) => {
+    if (active) {
+      button.dataset.draftActive = 'true';
+      button.setAttribute('title', 'Save or close current draft first');
+    } else {
+      delete button.dataset.draftActive;
+      button.removeAttribute('title');
+    }
+  });
+}
+
+function scrollPaneIntoView(card) {
+  if (!card) return;
+
+  const panes = window.ZcastPanes;
+  if (panes && typeof panes.scrollToPane === 'function') {
+    try {
+      panes.scrollToPane(card);
+      return;
+    } catch {
+      // Fall through to the plain DOM fallback below.
+    }
+  }
+
+  if (typeof card.scrollIntoView === 'function') {
+    card.scrollIntoView({ behavior: 'smooth', block: 'nearest', inline: 'end' });
+  }
+}
+
+function pulseCard(card) {
+  if (!card) return;
+
+  card.classList.remove('zcast-card--highlight');
+  // Force a reflow so the pulse restarts when the same pane is targeted twice.
+  void card.offsetWidth;
+  card.classList.add('zcast-card--highlight');
+  window.setTimeout(() => card.classList.remove('zcast-card--highlight'), 1400);
+}
+
+function focusDraftPane(card, message = '') {
+  if (!card) return;
+
+  const state = editorStates.get(card);
+  scrollPaneIntoView(card);
+  pulseCard(card);
+
+  if (state?.editing) {
+    const title = normaliseTitle(state.titleElement?.textContent);
+    if (!title) focusContentEditable(state.titleElement, true);
+    else if (state.editor) state.editor.commands.focus('end');
+  } else {
+    const title = draftTitle(card);
+    void enterEdit(card, { draft: true, focus: title ? 'body' : 'title' });
+  }
+
+  if (message) setStatus(card, message, 'hint');
+  syncDraftActiveState();
+}
+
+function ensureDiscardButton(card) {
+  if (!card || card.querySelector('[data-zcast-discard-draft]')) return;
+
+  const toolbar = card.querySelector('[data-zcast-card-toolbar]');
+  if (!toolbar) return;
+
+  const button = document.createElement('button');
+  button.type = 'button';
+  button.className = 'zcast-btn zcast-btn-discard';
+  button.dataset.zcastDiscardDraft = '';
+  button.title = 'Discard this unsaved draft';
+  button.textContent = 'Discard';
+  toolbar.appendChild(button);
+}
+
+function removeDiscardButton(card) {
+  card?.querySelector?.('[data-zcast-discard-draft]')?.remove();
+}
+
+/**
+ * Multi-card SSR pages (/?stack=…) reuse a single toolbar slot, so every
+ * card can end up showing the first card's ID and Public/Private state.
+ * Re-sync each toolbar from its own card attributes on boot.
+ */
+function hydrateCardToolbar(card) {
+  if (!card) return;
+
+  const id = cardId(card);
+  const state = editorStates.get(card);
+  const editButton = card.querySelector('[data-zcast-edit-toggle]');
+
+  if (editButton) {
+    if (id) editButton.dataset.zcastCardId = id;
+    else editButton.removeAttribute('data-zcast-card-id');
+    if (!state?.editing) applyEditButton(card, false);
+  }
+
+  const privateButton = card.querySelector('[data-zcast-private-toggle]');
+  if (privateButton) {
+    if (id) privateButton.dataset.zcastCardId = id;
+    else privateButton.removeAttribute('data-zcast-card-id');
+  }
+
+  const privateValue = state
+    ? state.private
+      ? 'true'
+      : 'false'
+    : (card.dataset.zcastCardPrivate ?? privateButton?.dataset.private);
+
+  if (privateValue === 'true' || privateValue === 'false') {
+    applyPrivateButton(card, privateValue === 'true');
+  }
+}
+
+function hydrateCardToolbars() {
+  document.querySelectorAll('[data-zcast-card]').forEach(hydrateCardToolbar);
+}
+
 function escapeHtml(value) {
   return String(value ?? '')
     .replace(/&/g, '&amp;')
@@ -379,13 +557,13 @@ function setStatus(card, text, kind = '') {
   if (kind) element.dataset.state = kind;
   else delete element.dataset.state;
 
-  if (kind === 'saved' && text) {
+  if (text && (kind === 'saved' || kind === 'hint')) {
     const timer = setTimeout(() => {
       if (element.textContent === text) {
         element.textContent = '';
         delete element.dataset.state;
       }
-    }, SAVED_STATUS_MS);
+    }, kind === 'hint' ? HINT_STATUS_MS : SAVED_STATUS_MS);
     statusTimers.set(element, timer);
   }
 }
@@ -536,6 +714,11 @@ async function enterEdit(card, options = {}) {
     ? existing?.markdown ?? note.markdown_body ?? ''
     : note.markdown_body ?? '';
 
+  // A brand-new "+ New Note" pane starts clean: exiting it without typing
+  // anything must not create an empty "Untitled" note (issue #4).
+  const blankDraft =
+    draft && !note.id && !normaliseTitle(note.title) && !normaliseTitle(markdown);
+
   const state = {
     card,
     note,
@@ -550,7 +733,7 @@ async function enterEdit(card, options = {}) {
     markdown,
     renderedHtml: existing?.renderedHtml ?? originalHtml,
     originalHtml,
-    dirty: Boolean(options.draft || draft),
+    dirty: blankDraft ? false : Boolean(options.draft || draft),
     saving: false,
     savePromise: null,
     saveTimer: null,
@@ -559,10 +742,14 @@ async function enterEdit(card, options = {}) {
   editorStates.set(card, state);
   liveStates.add(state);
 
-  mountEditor(state, options.focus || 'body');
+  if (draft) ensureDiscardButton(card);
+
+  mountEditor(state, options.focus || 'body', {
+    deferFocus: Boolean(options.deferFocus),
+  });
 }
 
-function mountEditor(state, focusMode) {
+function mountEditor(state, focusMode, options = {}) {
   const { card, bodyElement, titleElement, note } = state;
 
   titleElement.textContent = note.title || '';
@@ -617,24 +804,46 @@ function mountEditor(state, focusMode) {
 
   state.editor = editor;
 
-  if (focusMode === 'title') {
-    focusContentEditable(titleElement, true);
+  const applyFocus = () => {
+    if (!state.editing) return;
+    if (focusMode === 'title') {
+      focusContentEditable(titleElement, true);
+    } else {
+      editor.commands.focus('end');
+    }
+  };
+
+  if (options.deferFocus) {
+    // Let the horizontal slide-in paint before focus-scroll can jump it.
+    window.requestAnimationFrame(() => window.requestAnimationFrame(applyFocus));
   } else {
-    editor.commands.focus('end');
+    applyFocus();
   }
 }
 
-async function exitEdit(state) {
+async function exitEdit(state, options = {}) {
   if (!state?.editing) return;
   if (state.editButton) state.editButton.disabled = true;
 
   hideFloatingToolbar();
   hideAutocomplete(state);
 
-  await flushSave(state);
+  const unsavedDraft = Boolean(state.draft) && !state.note?.id;
+  const blankDraft = unsavedDraft && draftIsEmptyState(state);
+  const discard = Boolean(options.discard) || blankDraft;
+
+  if (discard && state.saving && state.savePromise) await state.savePromise;
+
+  // An untouched draft never hits POST /_zcast/api/notes (issue #4).
+  if (!discard) await flushSave(state);
 
   state.editing = false;
   liveStates.delete(state);
+
+  if (state.saveTimer) {
+    clearTimeout(state.saveTimer);
+    state.saveTimer = null;
+  }
 
   if (state.editor) {
     state.editor.destroy();
@@ -642,6 +851,17 @@ async function exitEdit(state) {
   }
 
   const { card, bodyElement, titleElement } = state;
+
+  if (discard) {
+    editorStates.delete(card);
+    card.remove();
+    syncDraftActiveState();
+    if (typeof window.ZcastPanes?.rebuildBreadcrumbs === 'function') {
+      window.ZcastPanes.rebuildBreadcrumbs();
+    }
+    return;
+  }
+
   bodyElement.classList.remove('zcast-editing');
   bodyElement.innerHTML = state.renderedHtml ?? state.originalHtml ?? '';
 
@@ -654,6 +874,7 @@ async function exitEdit(state) {
   applyPrivateButton(card, state.private);
   card.removeAttribute('data-zcast-busy');
   if (state.draft) card.dataset.zcastDraft = 'true';
+  syncDraftActiveState();
 }
 
 function scheduleSave(state, delay = SAVE_DELAY_MS) {
@@ -670,6 +891,12 @@ function saveState(state, options = {}) {
 
   if (state.saving) {
     return state.savePromise || Promise.resolve(false);
+  }
+
+  // Never let autosave/Cmd+S create an empty "Untitled" note (issue #4).
+  if (state.draft && !state.note?.id && draftIsEmptyState(state)) {
+    state.dirty = false;
+    return Promise.resolve(true);
   }
 
   if (!state.dirty && !options.force) return Promise.resolve(true);
@@ -708,6 +935,73 @@ function saveState(state, options = {}) {
   return state.savePromise;
 }
 
+function mutateHtmlString(html, mutate) {
+  if (!html) return html;
+
+  const template = document.createElement('template');
+  template.innerHTML = html;
+  return mutate(template.content) ? template.innerHTML : html;
+}
+
+/** Apply an in-place link mutation to every open pane and its stored HTML. */
+function syncPaneLinks(mutate) {
+  document.querySelectorAll('[data-zcast-card]').forEach((card) => {
+    mutate(card);
+
+    const state = editorStates.get(card);
+    if (!state) return;
+
+    state.renderedHtml = mutateHtmlString(state.renderedHtml, mutate);
+    state.originalHtml = mutateHtmlString(state.originalHtml, mutate);
+  });
+}
+
+/** Upgrade admin `[[unresolved]]` anchors once the missing note is saved. */
+function upgradeUnresolvedLinks(title, slug) {
+  const wanted = normaliseSlug(slug);
+  const wantedTitle = titleKey(title);
+  if (!wanted || !wantedTitle) return;
+
+  syncPaneLinks((root) => {
+    let changed = false;
+
+    root.querySelectorAll('a[data-zcast-unresolved]').forEach((anchor) => {
+      const current = anchor.dataset.zcastUnresolved || anchor.textContent;
+      if (titleKey(current) !== wantedTitle) return;
+
+      anchor.dataset.zcastNote = wanted;
+      anchor.setAttribute('href', `/${wanted}`);
+      anchor.removeAttribute('data-zcast-unresolved');
+      anchor.classList.remove('zcast-unresolved');
+      anchor.classList.remove('zcast-unresolved-public');
+      if (!anchor.classList.length) anchor.removeAttribute('class');
+      changed = true;
+    });
+
+    return changed;
+  });
+}
+
+/** Keep renamed `[[links]]` pointing at the new slug across open panes. */
+function rewriteNoteLinks(previousSlug, nextSlug) {
+  const from = normaliseSlug(previousSlug);
+  const to = normaliseSlug(nextSlug);
+  if (!from || !to || from === to) return;
+
+  syncPaneLinks((root) => {
+    let changed = false;
+
+    root.querySelectorAll('a[data-zcast-note]').forEach((anchor) => {
+      if (normaliseSlug(anchor.dataset.zcastNote) !== from) return;
+      anchor.dataset.zcastNote = to;
+      anchor.setAttribute('href', `/${to}`);
+      changed = true;
+    });
+
+    return changed;
+  });
+}
+
 async function performSave(state) {
   const previousSlug = state.note?.slug || cardSlug(state.card);
   const wasDraft = state.draft || !state.note?.id;
@@ -738,6 +1032,8 @@ async function performSave(state) {
     state.draft = false;
     state.card.dataset.zcastDraft = 'false';
     state.card.dataset.zcastCardId = note.id;
+    state.card.classList.remove('zcast-card-draft');
+    removeDiscardButton(state.card);
   }
 
   state.note = { ...(state.note || {}), ...note };
@@ -756,6 +1052,14 @@ async function performSave(state) {
   if (nextSlug) state.card.dataset.zcastCardSlug = nextSlug;
   if (state.note.id) state.card.dataset.zcastCardId = state.note.id;
 
+  if (wasDraft && nextSlug) {
+    upgradeUnresolvedLinks(state.note.title || payload.title, nextSlug);
+  }
+
+  if (renamed && previousSlug && nextSlug && previousSlug !== nextSlug) {
+    rewriteNoteLinks(previousSlug, nextSlug);
+  }
+
   if (renamed || wasDraft) {
     const panes = window.ZcastPanes;
     if (panes && typeof panes.updateCardMeta === 'function') {
@@ -765,6 +1069,7 @@ async function performSave(state) {
   }
 
   applyPrivateButton(state.card, state.private);
+  syncDraftActiveState();
   return true;
 }
 
@@ -1383,10 +1688,11 @@ function hideAutocomplete(state = null) {
 
 function draftCardHtml(title, token) {
   const safeTitle = escapeHtml(title || '');
-  return `<article class="zcast-card zcast-card-draft" data-zcast-card data-zcast-card-id="" data-zcast-card-slug="" data-zcast-card-private="false" data-zcast-card-admin="true" data-zcast-draft="true" data-zcast-draft-token="${token}">
+  return `<article class="zcast-card zcast-card-draft zcast-card--entering" data-zcast-card data-zcast-card-id="" data-zcast-card-slug="" data-zcast-card-private="false" data-zcast-card-admin="true" data-zcast-draft="true" data-zcast-draft-token="${token}">
     <div class="zcast-card__toolbar" data-zcast-card-toolbar>
       <button type="button" class="zcast-btn zcast-btn-edit" data-zcast-edit-toggle data-zcast-card-id="" aria-pressed="false" title="Edit note">Edit</button>
       <button type="button" class="zcast-btn zcast-btn-private" data-zcast-private-toggle data-zcast-card-id="" data-private="false" aria-pressed="false" title="Public note - click to make private">Public</button>
+      <button type="button" class="zcast-btn zcast-btn-discard" data-zcast-discard-draft title="Discard this unsaved draft">Discard</button>
       <span class="zcast-save-status" data-zcast-save-status role="status" aria-live="polite"></span>
     </div>
     <header class="zcast-card__header"><h1 class="zcast-card-title" data-zcast-card-title contenteditable="false">${safeTitle}</h1></header>
@@ -1395,9 +1701,79 @@ function draftCardHtml(title, token) {
   </article>`;
 }
 
+async function reuseBlankDraft(card, title) {
+  const clean = normaliseTitle(title);
+  if (!clean) {
+    focusDraftPane(card);
+    return;
+  }
+
+  let state = editorStates.get(card);
+  if (!state?.editing) {
+    await enterEdit(card, { draft: true, title: clean, focus: 'body' });
+    state = editorStates.get(card);
+  }
+
+  if (state) {
+    state.note = { ...(state.note || {}), title: clean };
+    if (state.titleElement) state.titleElement.textContent = clean;
+    state.dirty = true;
+    if (state.editor) state.editor.commands.focus('end');
+    scheduleSave(state);
+  }
+
+  scrollPaneIntoView(card);
+  pulseCard(card);
+  setStatus(card, '');
+  syncDraftActiveState();
+}
+
+/**
+ * Opening an unresolved `[[Title]]` never spawns a duplicate draft: reuse the
+ * matching or untouched draft, otherwise jump to the unsaved one.
+ */
+async function openDraftForTitle(title, anchor = null) {
+  const clean = normaliseTitle(title);
+  const drafts = openDraftCards();
+
+  const matching = drafts.find((card) => titleKey(draftTitle(card)) === titleKey(clean));
+  if (matching) {
+    focusDraftPane(matching);
+    return matching;
+  }
+
+  const blank = drafts.find((card) => draftIsBlank(card));
+  if (blank) {
+    await reuseBlankDraft(blank, clean);
+    return blank;
+  }
+
+  if (drafts.length > 0) {
+    focusDraftPane(drafts[0], 'Save current draft first');
+    return drafts[0];
+  }
+
+  return openDraftPane(clean, anchor);
+}
+
 async function openDraftPane(title, anchor = null) {
+  const clean = normaliseTitle(title);
+
+  const existing = findOpenDraftCard();
+  if (existing) {
+    // Never spawn a second unsaved draft pane (issue #2).
+    if (clean && draftIsBlank(existing)) {
+      await reuseBlankDraft(existing, clean);
+    } else if (clean && titleKey(draftTitle(existing)) === titleKey(clean)) {
+      focusDraftPane(existing);
+    } else {
+      focusDraftPane(existing, 'Save or close current draft first');
+    }
+    return existing;
+  }
+
   const token = `draft-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-  const html = draftCardHtml(title, token);
+  const html = draftCardHtml(clean, token);
   let card = null;
   const existingCards = document.querySelectorAll('[data-zcast-card]');
   const anchorCard = anchor || existingCards[existingCards.length - 1] || null;
@@ -1432,14 +1808,42 @@ async function openDraftPane(title, anchor = null) {
     card = container.querySelector(`[data-zcast-draft-token="${token}"]`);
   }
 
-  if (!card) return;
+  if (!card) return null;
 
   card.removeAttribute('data-zcast-draft-token');
   card.dataset.zcastDraft = 'true';
-  card.scrollIntoView({ behavior: 'smooth', block: 'nearest', inline: 'end' });
+  ensureDiscardButton(card);
 
-  const focusMode = title ? 'body' : 'title';
-  await enterEdit(card, { draft: true, title: title || '', focus: focusMode });
+  window.setTimeout(() => card.classList.remove('zcast-card--entering'), 260);
+
+  const focusMode = clean ? 'body' : 'title';
+  await enterEdit(card, {
+    draft: true,
+    title: clean,
+    focus: focusMode,
+    deferFocus: true,
+  });
+
+  scrollPaneIntoView(card);
+  syncDraftActiveState();
+  return card;
+}
+
+async function discardDraft(card) {
+  if (!card) return;
+
+  const state = editorStates.get(card);
+  if (state?.editing) {
+    await exitEdit(state, { discard: true });
+    return;
+  }
+
+  editorStates.delete(card);
+  card.remove();
+  syncDraftActiveState();
+  if (typeof window.ZcastPanes?.rebuildBreadcrumbs === 'function') {
+    window.ZcastPanes.rebuildBreadcrumbs();
+  }
 }
 
 /* -------------------------------------------------------------------------- */
@@ -1458,7 +1862,18 @@ function handleDocumentClick(event) {
     event.preventDefault();
     event.stopPropagation();
     const title = unresolved.dataset.zcastUnresolved || unresolved.textContent.trim();
-    void openDraftPane(title, cardFor(unresolved));
+    void openDraftForTitle(title, cardFor(unresolved));
+    return;
+  }
+
+  const discardButton = element.closest('[data-zcast-discard-draft]');
+  if (discardButton) {
+    const card = cardFor(discardButton);
+    if (card) {
+      event.preventDefault();
+      event.stopPropagation();
+      void discardDraft(card);
+    }
     return;
   }
 
@@ -1466,6 +1881,12 @@ function handleDocumentClick(event) {
   if (newNote) {
     event.preventDefault();
     event.stopPropagation();
+    const existingDraft = findOpenDraftCard();
+    if (existingDraft) {
+      // Jump to (and pulse) the open draft instead of spawning duplicates.
+      focusDraftPane(existingDraft, 'Save or close current draft first');
+      return;
+    }
     void openDraftPane('');
     return;
   }
@@ -1547,7 +1968,22 @@ function handleViewportChange() {
   if (autocomplete.open) positionAutocomplete();
 }
 
+/** Keep the "+ New Note" affordance honest when panes.js truncates panes. */
+function observeDraftPanes() {
+  if (typeof MutationObserver !== 'function') return;
+
+  const container =
+    document.querySelector('[data-zcast-panes]') || document.querySelector('.zcast-panes');
+  if (!container) return;
+
+  new MutationObserver(() => syncDraftActiveState()).observe(container, { childList: true });
+}
+
 function init() {
+  hydrateCardToolbars();
+  syncDraftActiveState();
+  observeDraftPanes();
+
   document.addEventListener('click', handleDocumentClick, true);
   document.addEventListener('input', handleDocumentInput);
   document.addEventListener('keydown', handleDocumentKeyDown, true);
