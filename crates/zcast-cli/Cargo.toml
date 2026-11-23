@@ -1,0 +1,23 @@
+[package]
+name = "zcast-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "CLI entrypoint for zcast (serve, status, module list)"
+
+[[bin]]
+name = "zcast"
+path = "src/main.rs"
+
+[dependencies]
+zcast-interfaces.workspace = true
+zcast-kernel.workspace = true
+zcast-storage-sqlite.workspace = true
+zcast-links-wikilink.workspace = true
+zcast-editor-inline.workspace = true
+zcast-theme-davidhewitson.workspace = true
+axum.workspace = true
+clap.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

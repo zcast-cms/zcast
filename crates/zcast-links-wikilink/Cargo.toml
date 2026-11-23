@@ -1,0 +1,19 @@
+[package]
+name = "zcast-links-wikilink"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Default [[wikilink]] parser, graph, backlinks, and Markdown renderer for zcast"
+
+[dependencies]
+zcast-interfaces.workspace = true
+ammonia.workspace = true
+async-trait.workspace = true
+chrono.workspace = true
+pulldown-cmark.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+zcast-storage-sqlite.workspace = true
+tokio.workspace = true

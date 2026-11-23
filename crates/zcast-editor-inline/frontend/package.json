@@ -1,0 +1,23 @@
+{
+  "name": "zcast-editor-inline-frontend",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Pre-bundled TipTap editor source for zcast-editor-inline (DEC-17)",
+  "scripts": {
+    "build": "esbuild src/editor.js --bundle --minify --format=iife --target=es2020 --outfile=../assets/editor.bundle.js",
+    "watch": "esbuild src/editor.js --bundle --format=iife --target=es2020 --outfile=../assets/editor.bundle.js --watch"
+  },
+  "dependencies": {
+    "@tiptap/core": "2.27.3",
+    "@tiptap/extension-link": "2.27.3",
+    "@tiptap/extension-placeholder": "2.27.3",
+    "@tiptap/extension-underline": "2.27.3",
+    "@tiptap/pm": "2.27.3",
+    "@tiptap/starter-kit": "2.27.3",
+    "markdown-it": "14.1.0"
+  },
+  "devDependencies": {
+    "esbuild": "0.28.2"
+  }
+}

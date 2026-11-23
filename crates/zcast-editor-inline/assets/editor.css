@@ -1,0 +1,445 @@
+/* zcast-editor-inline — theme-token driven editor chrome.
+ * Every colour, font, radius and elevation comes from a --zcast-* custom
+ * property so this file is identical for dark, light and auto themes.
+ */
+
+/* -------------------------------------------------------------------------- */
+/* Card toolbar                                                               */
+/* -------------------------------------------------------------------------- */
+
+.zcast-btn {
+  appearance: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.3em;
+  min-height: 1.9em;
+  padding: 0.22em 0.68em;
+  border: 1px solid var(--zcast-border);
+  border-radius: var(--zcast-radius);
+  background: var(--zcast-surface);
+  color: var(--zcast-text-muted);
+  font-family: var(--zcast-font-body);
+  font-size: 0.82em;
+  font-weight: 600;
+  line-height: 1.2;
+  cursor: pointer;
+  transition:
+    background-color 120ms ease,
+    border-color 120ms ease,
+    color 120ms ease;
+}
+
+.zcast-btn:hover {
+  background: var(--zcast-accent-subtle);
+  border-color: var(--zcast-accent);
+  color: var(--zcast-text);
+}
+
+.zcast-btn:focus-visible {
+  outline: 2px solid var(--zcast-accent);
+  outline-offset: 2px;
+}
+
+.zcast-btn[aria-pressed="true"] {
+  background: var(--zcast-accent);
+  border-color: var(--zcast-accent);
+  color: var(--zcast-bg);
+}
+
+.zcast-btn:disabled {
+  cursor: progress;
+  opacity: 0.6;
+}
+
+.zcast-btn-private[data-private="true"] {
+  border-color: var(--zcast-accent);
+  background: var(--zcast-accent-subtle);
+  color: var(--zcast-accent);
+}
+
+.zcast-save-status {
+  display: inline-block;
+  min-width: 4.6em;
+  color: var(--zcast-text-muted);
+  font-family: var(--zcast-font-body);
+  font-size: 0.78em;
+  line-height: 1.2;
+  white-space: nowrap;
+}
+
+.zcast-save-status[data-state="saving"] {
+  color: var(--zcast-accent);
+}
+
+.zcast-save-status[data-state="saved"] {
+  color: var(--zcast-text-muted);
+}
+
+.zcast-save-status[data-state="error"] {
+  color: var(--zcast-accent);
+  text-decoration: underline wavy var(--zcast-accent);
+  text-underline-offset: 0.2em;
+}
+
+/* -------------------------------------------------------------------------- */
+/* In-place title + editor surface                                            */
+/* -------------------------------------------------------------------------- */
+
+[data-zcast-card-title][contenteditable="true"] {
+  min-height: 1.15em;
+  padding: 0.08em 0.18em;
+  border-radius: var(--zcast-radius);
+  background: var(--zcast-accent-subtle);
+  box-shadow: inset 0 -2px 0 var(--zcast-accent);
+  outline: none;
+  cursor: text;
+}
+
+[data-zcast-card-title][contenteditable="true"]:empty::before {
+  color: var(--zcast-text-muted);
+  content: attr(data-zcast-placeholder);
+  pointer-events: none;
+}
+
+[data-zcast-card-title][contenteditable="true"]:focus-visible {
+  box-shadow:
+    inset 0 -2px 0 var(--zcast-accent),
+    0 0 0 2px var(--zcast-accent-subtle);
+}
+
+[data-zcast-card-body].zcast-editing {
+  cursor: text;
+}
+
+.zcast-editor-surface {
+  position: relative;
+  width: 100%;
+}
+
+.zcast-editor-prose,
+.zcast-editor-prose.ProseMirror {
+  min-height: calc(var(--zcast-text-base) * 6);
+  max-width: var(--zcast-measure);
+  outline: none;
+  color: var(--zcast-text);
+  font-family: var(--zcast-font-body);
+  font-size: var(--zcast-text-base);
+  line-height: var(--zcast-leading-body);
+  caret-color: var(--zcast-accent);
+}
+
+.zcast-editor-prose > *:first-child {
+  margin-top: 0;
+}
+
+.zcast-editor-prose > *:last-child {
+  margin-bottom: 0;
+}
+
+.zcast-editor-prose p {
+  margin: 0 0 0.85em;
+}
+
+.zcast-editor-prose h1,
+.zcast-editor-prose h2,
+.zcast-editor-prose h3,
+.zcast-editor-prose h4,
+.zcast-editor-prose h5,
+.zcast-editor-prose h6 {
+  margin: 1.35em 0 0.45em;
+  color: var(--zcast-text);
+  font-family: var(--zcast-font-heading);
+  line-height: 1.22;
+}
+
+.zcast-editor-prose h1 {
+  font-size: 1.8em;
+}
+
+.zcast-editor-prose h2 {
+  font-size: 1.45em;
+}
+
+.zcast-editor-prose h3 {
+  font-size: 1.2em;
+}
+
+.zcast-editor-prose ul,
+.zcast-editor-prose ol {
+  margin: 0 0 0.85em;
+  padding-left: 1.45em;
+}
+
+.zcast-editor-prose li > p {
+  margin: 0.18em 0;
+}
+
+.zcast-editor-prose blockquote {
+  margin: 1em 0;
+  padding: 0.1em 0 0.1em 1em;
+  border-left: 3px solid var(--zcast-accent);
+  color: var(--zcast-text-muted);
+}
+
+.zcast-editor-prose code {
+  padding: 0.12em 0.34em;
+  border: 1px solid var(--zcast-border);
+  border-radius: var(--zcast-radius);
+  background: var(--zcast-surface);
+  font-family: var(--zcast-font-mono);
+  font-size: 0.9em;
+}
+
+.zcast-editor-prose pre {
+  margin: 1em 0;
+  padding: 0.9em 1em;
+  overflow-x: auto;
+  border: 1px solid var(--zcast-border);
+  border-radius: var(--zcast-radius);
+  background: var(--zcast-surface);
+  line-height: 1.5;
+}
+
+.zcast-editor-prose pre code {
+  padding: 0;
+  border: 0;
+  background: none;
+  font-size: 0.88em;
+}
+
+.zcast-editor-prose a {
+  color: var(--zcast-accent);
+  text-decoration: underline;
+  text-underline-offset: 0.16em;
+}
+
+.zcast-editor-prose hr {
+  margin: 1.6em 0;
+  border: 0;
+  border-top: 1px solid var(--zcast-border);
+}
+
+.zcast-editor-prose u {
+  text-decoration: underline;
+  text-underline-offset: 0.16em;
+}
+
+.zcast-editor-prose ::selection {
+  background: var(--zcast-accent-subtle);
+}
+
+.zcast-wikilink-text {
+  padding: 0.02em 0.12em;
+  border-radius: calc(var(--zcast-radius) / 2);
+  background: var(--zcast-accent-subtle);
+  text-decoration: underline;
+  text-decoration-color: var(--zcast-accent);
+  text-underline-offset: 0.16em;
+}
+
+.zcast-editor-prose p.is-editor-empty:first-child::before {
+  height: 0;
+  float: left;
+  color: var(--zcast-text-muted);
+  content: attr(data-placeholder);
+  pointer-events: none;
+}
+
+/* -------------------------------------------------------------------------- */
+/* Floating formatting toolbar                                                */
+/* -------------------------------------------------------------------------- */
+
+.zcast-editor-toolbar {
+  position: fixed;
+  z-index: calc(var(--zcast-z-toolbar) + 2);
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  max-width: calc(100vw - 16px);
+  padding: 4px;
+  border: 1px solid var(--zcast-border);
+  border-radius: var(--zcast-radius);
+  background: var(--zcast-surface);
+  box-shadow: var(--zcast-shadow-popover);
+  font-family: var(--zcast-font-body);
+}
+
+.zcast-editor-toolbar[hidden] {
+  display: none;
+}
+
+.zcast-toolbar-btn {
+  appearance: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 1.85em;
+  height: 1.9em;
+  padding: 0 0.45em;
+  border: 0;
+  border-radius: calc(var(--zcast-radius) / 1.5);
+  background: none;
+  color: var(--zcast-text);
+  font-family: var(--zcast-font-body);
+  font-size: 0.82em;
+  font-weight: 600;
+  line-height: 1;
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.zcast-toolbar-btn:hover {
+  background: var(--zcast-accent-subtle);
+}
+
+.zcast-toolbar-btn:focus-visible {
+  outline: 2px solid var(--zcast-accent);
+  outline-offset: 1px;
+}
+
+.zcast-toolbar-btn[data-active="true"] {
+  background: var(--zcast-accent);
+  color: var(--zcast-bg);
+}
+
+.zcast-toolbar-bold {
+  font-weight: 800;
+}
+
+.zcast-toolbar-italic {
+  font-family: var(--zcast-font-heading);
+  font-style: italic;
+}
+
+.zcast-toolbar-underline {
+  text-decoration: underline;
+  text-underline-offset: 0.16em;
+}
+
+.zcast-toolbar-code {
+  font-family: var(--zcast-font-mono);
+  font-size: 0.72em;
+}
+
+.zcast-toolbar-wikilink {
+  font-family: var(--zcast-font-mono);
+  font-size: 0.72em;
+}
+
+.zcast-toolbar-sep {
+  width: 1px;
+  height: 1.2em;
+  margin: 0 2px;
+  background: var(--zcast-border);
+}
+
+/* -------------------------------------------------------------------------- */
+/* [[wikilink]] autocomplete                                                  */
+/* -------------------------------------------------------------------------- */
+
+.zcast-wikilink-menu {
+  position: fixed;
+  z-index: calc(var(--zcast-z-toolbar) + 3);
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  width: max-content;
+  min-width: 16em;
+  max-width: min(22em, calc(100vw - 16px));
+  max-height: 17em;
+  padding: 4px;
+  overflow-y: auto;
+  border: 1px solid var(--zcast-border);
+  border-radius: var(--zcast-radius);
+  background: var(--zcast-surface);
+  box-shadow: var(--zcast-shadow-popover);
+  font-family: var(--zcast-font-body);
+}
+
+.zcast-wikilink-menu[hidden] {
+  display: none;
+}
+
+.zcast-wikilink-option {
+  appearance: none;
+  display: flex;
+  align-items: baseline;
+  gap: 0.55em;
+  width: 100%;
+  padding: 0.42em 0.55em;
+  border: 0;
+  border-radius: calc(var(--zcast-radius) / 1.5);
+  background: none;
+  color: var(--zcast-text);
+  font-family: var(--zcast-font-body);
+  font-size: 0.88em;
+  line-height: 1.3;
+  text-align: left;
+  cursor: pointer;
+}
+
+.zcast-wikilink-option:hover,
+.zcast-wikilink-option.is-active {
+  background: var(--zcast-accent-subtle);
+}
+
+.zcast-wikilink-option.is-active {
+  box-shadow: inset 2px 0 0 var(--zcast-accent);
+}
+
+.zcast-wikilink-title {
+  flex: 1 1 auto;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.zcast-wikilink-slug {
+  flex: 0 1 auto;
+  overflow: hidden;
+  max-width: 11em;
+  color: var(--zcast-text-muted);
+  font-family: var(--zcast-font-mono);
+  font-size: 0.78em;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.zcast-wikilink-private {
+  flex: 0 0 auto;
+  padding: 0.05em 0.35em;
+  border: 1px solid var(--zcast-border);
+  border-radius: calc(var(--zcast-radius) / 1.5);
+  color: var(--zcast-text-muted);
+  font-size: 0.7em;
+  line-height: 1.4;
+}
+
+.zcast-wikilink-empty {
+  padding: 0.55em 0.65em;
+  color: var(--zcast-text-muted);
+  font-size: 0.84em;
+}
+
+/* -------------------------------------------------------------------------- */
+/* Reader-side link/draft affordances                                         */
+/* -------------------------------------------------------------------------- */
+
+a[data-zcast-unresolved] {
+  color: var(--zcast-accent);
+  text-decoration: underline dashed;
+  text-underline-offset: 0.18em;
+  cursor: pointer;
+}
+
+.zcast-card-draft {
+  border-style: dashed;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .zcast-btn,
+  .zcast-toolbar-btn {
+    transition: none;
+  }
+}

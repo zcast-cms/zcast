@@ -1,0 +1,15 @@
+[package]
+name = "zcast-storage-sqlite"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "SQLite (WAL mode) Storage & ModuleStore provider for zcast"
+
+[dependencies]
+zcast-interfaces.workspace = true
+async-trait.workspace = true
+chrono.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sqlx.workspace = true
+tokio.workspace = true
