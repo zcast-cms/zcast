@@ -462,3 +462,303 @@ async fn renaming_rewrites_self_links_in_the_renamed_note() {
         "stale self edge must be gone: {edges:?}"
     );
 }
+
+/* ------------------------------------------------------------------------- */
+/* Real-time card fragments (issue #11 / v0.1.2 polish #4)                   */
+/* ------------------------------------------------------------------------- */
+
+fn json_request(method: &str, uri: &str, payload: serde_json::Value) -> Request<Body> {
+    Request::builder()
+        .method(method)
+        .uri(uri)
+        .header("content-type", "application/json")
+        .body(Body::from(payload.to_string()))
+        .unwrap()
+}
+
+async fn send(app: &axum::Router, request: Request<Body>) -> (StatusCode, serde_json::Value) {
+    let resp = app.clone().oneshot(request).await.unwrap();
+    let status = resp.status();
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let value = if body.is_empty() {
+        serde_json::Value::Null
+    } else {
+        serde_json::from_slice(&body).unwrap()
+    };
+    (status, value)
+}
+
+async fn card_fragment(app: &axum::Router, slug: &str) -> serde_json::Value {
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/_zcast/cards/{slug}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "fragment for {slug}");
+    serde_json::from_slice(
+        &axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap()
+}
+
+fn backlink_slugs(fragment: &serde_json::Value) -> Vec<String> {
+    fragment["card"]["backlinks"]
+        .as_array()
+        .expect("card.backlinks array")
+        .iter()
+        .filter_map(|b| b["slug"].as_str().map(str::to_owned))
+        .collect()
+}
+
+fn has_backlink(fragment: &serde_json::Value, slug: &str) -> bool {
+    backlink_slugs(fragment).iter().any(|s| s == slug)
+}
+
+#[tokio::test]
+async fn card_fragment_is_served_with_no_store_cache_control() {
+    let kernel = test_kernel(ThemeColorMode::Dark).await;
+    let app = zcast_kernel::http::router(kernel);
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/_zcast/cards/how-sliding-panes-work")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        resp.headers()
+            .get("cache-control")
+            .and_then(|v| v.to_str().ok()),
+        Some("no-store"),
+        "card fragments must never be cacheable"
+    );
+}
+
+#[tokio::test]
+async fn adding_and_removing_wikilink_updates_card_fragment_backlinks_immediately() {
+    let kernel = test_kernel(ThemeColorMode::Auto).await;
+    let app = zcast_kernel::http::router(kernel);
+
+    const TARGET: &str = "how-sliding-panes-work";
+    const REFERRER: &str = "realtime-referrer";
+
+    // POST creates a note that already cites the target: the target fragment
+    // must show it as a backlink straight away (no re-render/restart).
+    let (status, created) = send(
+        &app,
+        json_request(
+            "POST",
+            "/_zcast/api/notes",
+            serde_json::json!({
+                "title": "Realtime Referrer",
+                "markdown_body": "This note cites [[How Sliding Panes Work]].",
+                "private": false
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let referrer_id = created["note"]["id"].as_str().unwrap().to_owned();
+
+    let after_create = card_fragment(&app, TARGET).await;
+    assert!(
+        has_backlink(&after_create, REFERRER),
+        "POST with [[link]] must appear in card.backlinks: {after_create}"
+    );
+    let html = after_create["html"].as_str().unwrap();
+    assert!(html.contains("Linked from"), "{html}");
+    assert!(
+        html.contains(r#"data-zcast-note="realtime-referrer""#),
+        "POST with [[link]] must render a Linked from entry: {html}"
+    );
+
+    // PUT removes the link: the backlink must disappear immediately.
+    let (status, _) = send(
+        &app,
+        json_request(
+            "PUT",
+            &format!("/_zcast/api/notes/{referrer_id}"),
+            serde_json::json!({
+                "title": "Realtime Referrer",
+                "markdown_body": "The link has been removed.",
+                "private": false
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let after_remove = card_fragment(&app, TARGET).await;
+    assert!(
+        !has_backlink(&after_remove, REFERRER),
+        "removed [[link]] must vanish from card.backlinks: {after_remove}"
+    );
+    let html = after_remove["html"].as_str().unwrap();
+    assert!(
+        !html.contains(r#"data-zcast-note="realtime-referrer""#),
+        "removed [[link]] must vanish from rendered Linked from HTML: {html}"
+    );
+
+    // PUT adds the link back: it must reappear immediately.
+    let (status, _) = send(
+        &app,
+        json_request(
+            "PUT",
+            &format!("/_zcast/api/notes/{referrer_id}"),
+            serde_json::json!({
+                "title": "Realtime Referrer",
+                "markdown_body": "Now it cites [[How Sliding Panes Work]] again.",
+                "private": false
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let after_readd = card_fragment(&app, TARGET).await;
+    assert!(
+        has_backlink(&after_readd, REFERRER),
+        "re-added [[link]] must reappear in card.backlinks: {after_readd}"
+    );
+    let html = after_readd["html"].as_str().unwrap();
+    assert!(
+        html.contains(r#"data-zcast-note="realtime-referrer""#),
+        "re-added [[link]] must reappear in rendered Linked from HTML: {html}"
+    );
+}
+
+#[tokio::test]
+async fn renaming_note_updates_citing_card_fragment_immediately() {
+    let kernel = test_kernel(ThemeColorMode::Auto).await;
+
+    let panes = kernel
+        .storage
+        .get_note_by_slug_or_alias("how-sliding-panes-work", ReadContext::ADMIN)
+        .await
+        .unwrap()
+        .unwrap()
+        .note;
+    let app = zcast_kernel::http::router(kernel);
+
+    let (status, saved) = send(
+        &app,
+        json_request(
+            "PUT",
+            &format!("/_zcast/api/notes/{}", panes.id.as_str()),
+            serde_json::json!({
+                "title": "Panes Deep Dive",
+                "markdown_body": panes.markdown_body,
+                "private": false
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(saved["renamed_from_slug"], "how-sliding-panes-work");
+    assert_eq!(saved["note"]["slug"], "panes-deep-dive");
+
+    // Index cites the renamed note; its fragment must be rewritten right away.
+    let citing = card_fragment(&app, "index").await;
+    let citing_html = citing["html"].as_str().unwrap();
+    let citing_rendered = citing["card"]["rendered_html"].as_str().unwrap();
+    for html in [citing_html, citing_rendered] {
+        assert!(
+            html.contains("Panes Deep Dive"),
+            "citing card must show the new title text: {html}"
+        );
+        assert!(
+            html.contains(r#"data-zcast-note="panes-deep-dive""#),
+            "citing card must point at the new slug: {html}"
+        );
+        assert!(
+            !html.contains("How Sliding Panes Work"),
+            "citing card must not keep the old title: {html}"
+        );
+    }
+
+    // The renamed note still records the citing note in its backlinks.
+    let renamed = card_fragment(&app, "panes-deep-dive").await;
+    assert_eq!(renamed["canonical_slug"], "panes-deep-dive");
+    assert!(
+        has_backlink(&renamed, "index"),
+        "renamed card must still list its citing note: {renamed}"
+    );
+    let renamed_html = renamed["html"].as_str().unwrap();
+    assert!(renamed_html.contains("Linked from"), "{renamed_html}");
+    assert!(
+        renamed_html.contains(r#"data-zcast-note="index""#),
+        "{renamed_html}"
+    );
+
+    // Historical aliases keep resolving, but report the canonical slug so
+    // editors can hot-swap the correct pane.
+    let alias = card_fragment(&app, "how-sliding-panes-work").await;
+    assert_eq!(alias["canonical_slug"], "panes-deep-dive");
+}
+
+#[tokio::test]
+async fn deleting_citing_note_removes_it_from_backlinks_immediately() {
+    let kernel = test_kernel(ThemeColorMode::Auto).await;
+    let app = zcast_kernel::http::router(kernel);
+
+    const TARGET: &str = "how-sliding-panes-work";
+    const REFERRER: &str = "doomed-referrer";
+
+    let (status, created) = send(
+        &app,
+        json_request(
+            "POST",
+            "/_zcast/api/notes",
+            serde_json::json!({
+                "title": "Doomed Referrer",
+                "markdown_body": "This note will be deleted but cites [[How Sliding Panes Work]].",
+                "private": false
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let referrer_id = created["note"]["id"].as_str().unwrap().to_owned();
+
+    assert!(
+        has_backlink(&card_fragment(&app, TARGET).await, REFERRER),
+        "referrer must be visible before deletion"
+    );
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri(format!("/_zcast/api/notes/{referrer_id}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+    let after_delete = card_fragment(&app, TARGET).await;
+    assert!(
+        !has_backlink(&after_delete, REFERRER),
+        "deleted note must vanish from card.backlinks: {after_delete}"
+    );
+    let html = after_delete["html"].as_str().unwrap();
+    assert!(
+        !html.contains(r#"data-zcast-note="doomed-referrer""#),
+        "deleted note must vanish from rendered Linked from HTML: {html}"
+    );
+}

@@ -68,6 +68,7 @@ function wikilinkDecorations(doc) {
       decorations.push(
         Decoration.inline(pos + match.index, pos + match.index + match[0].length, {
           class: 'zcast-wikilink-text',
+          title: 'Cmd+Click (or Ctrl+Click) to open',
         }),
       );
       match = pattern.exec(node.text);
@@ -617,6 +618,95 @@ function readMarkdown(state) {
   return state?.markdown ?? state?.note?.markdown_body ?? '';
 }
 
+/** Every `[data-zcast-card]` pane currently in the DOM, left to right. */
+function allCardPanes() {
+  return Array.from(document.querySelectorAll('[data-zcast-card]'));
+}
+
+/* -------------------------------------------------------------------------- */
+/* [[wikilink]] targets                                                       */
+/* -------------------------------------------------------------------------- */
+
+const WIKILINK_PATTERN = /\[\[[^\[\]\n]+\]\]/g;
+
+/** Split `[[Title]]` / `[[Title|Display]]` into its target and display text. */
+function parseWikilinkTarget(raw) {
+  let text = String(raw ?? '').trim();
+  if (!text) return null;
+
+  if (text.startsWith('[[')) text = text.slice(2);
+  if (text.endsWith(']]')) text = text.slice(0, -2);
+
+  const pipe = text.indexOf('|');
+  const target = normaliseTitle(pipe >= 0 ? text.slice(0, pipe) : text);
+  if (!target) return null;
+
+  const display = normaliseTitle(pipe >= 0 ? text.slice(pipe + 1) : target);
+  return { target, display: display || target };
+}
+
+/**
+ * All closed `[[wikilinks]]` in a ProseMirror document with their absolute
+ * positions, skipping anything inside inline code or a fenced code block.
+ */
+function collectWikilinks(doc) {
+  const links = [];
+  if (!doc) return links;
+
+  doc.descendants((node, nodePos, parent) => {
+    if (!node.isText || !node.text) return;
+    if (parent?.type?.name === 'codeBlock') return false;
+    if (node.marks?.some((mark) => mark.type.name === 'code')) return;
+
+    WIKILINK_PATTERN.lastIndex = 0;
+    let match = WIKILINK_PATTERN.exec(node.text);
+    while (match) {
+      const parsed = parseWikilinkTarget(match[0]);
+      if (parsed) {
+        const from = nodePos + match.index;
+        links.push({ ...parsed, raw: match[0], from, to: from + match[0].length });
+      }
+      match = WIKILINK_PATTERN.exec(node.text);
+    }
+  });
+
+  return links;
+}
+
+/** The closed `[[wikilink]]` a cursor/position sits inside (or null). */
+function findWikilinkAtPos(doc, pos) {
+  if (typeof pos !== 'number' || pos < 0) return null;
+  return collectWikilinks(doc).find((link) => pos >= link.from && pos <= link.to) || null;
+}
+
+/** The closed `[[wikilink]]` a selection (or collapsed caret) touches, if any. */
+function findWikilinkInRange(doc, from, to) {
+  const links = collectWikilinks(doc);
+  if (from === to) return links.find((link) => from >= link.from && from <= link.to) || null;
+  return links.find((link) => link.from < to && link.to > from) || null;
+}
+
+/** Mirror of the kernel's `slugify` so unresolved titles can be probed. */
+function slugifyTarget(input) {
+  let out = '';
+  let prevDash = false;
+
+  for (const char of String(input ?? '').trim()) {
+    if (/[A-Za-z0-9]/.test(char)) {
+      out += char.toLowerCase();
+      prevDash = false;
+    } else if (char === '-' || char === '_' || char === '/' || /\s/.test(char)) {
+      if (!prevDash && out) {
+        out += '-';
+        prevDash = true;
+      }
+    }
+  }
+
+  out = out.replace(/-+$/, '');
+  return out || 'untitled';
+}
+
 /* -------------------------------------------------------------------------- */
 /* Network                                                                    */
 /* -------------------------------------------------------------------------- */
@@ -654,6 +744,149 @@ async function requestJson(url, options = {}) {
 async function fetchNote(id) {
   const data = await requestJson(`${API_NOTES}/${encodeURIComponent(id)}`);
   return data.note || data;
+}
+
+/**
+ * Resolve a `[[wikilink]]` title to a slug: exact case-insensitive title match
+ * or exact slug match from the (admin-only, 25 hit) notes search, then an
+ * alias-safe probe of the public card fragment endpoint.
+ */
+async function resolveWikilinkSlug(title) {
+  const wanted = normaliseTitle(title);
+  if (!wanted) return '';
+
+  const wantedKey = wanted.toLowerCase();
+  const wantedSlug = slugifyTarget(wanted);
+
+  try {
+    const params = new URLSearchParams({ q: wanted });
+    const data = await requestJson(`${API_NOTES}?${params.toString()}`);
+    const notes = Array.isArray(data) ? data : data?.notes || data?.results || [];
+
+    const byTitle = notes.find((note) => titleKey(note?.title) === wantedKey);
+    if (byTitle?.slug) return normaliseSlug(byTitle.slug);
+
+    const bySlug = notes.find(
+      (note) => normaliseSlug(note?.slug).toLowerCase() === wantedSlug,
+    );
+    if (bySlug?.slug) return normaliseSlug(bySlug.slug);
+  } catch {
+    // Search is admin-only: fall through to the fragment probe below.
+  }
+
+  try {
+    const response = await fetch(`/_zcast/cards/${encodeURIComponent(wantedSlug)}`, {
+      method: 'GET',
+      headers: { Accept: 'application/json' },
+      credentials: 'same-origin',
+      cache: 'no-store',
+    });
+
+    if (!response.ok) return '';
+
+    const data = await response.json().catch(() => null);
+    return normaliseSlug(data?.canonical_slug || data?.card?.slug || wantedSlug);
+  } catch {
+    return '';
+  }
+}
+
+/** Open a note slug in a pane to the right (never leaving edit mode). */
+function openSlugInPane(slug, anchorCard = null) {
+  const value = normaliseSlug(slug);
+  if (!value) return false;
+
+  const panes = window.ZcastPanes;
+
+  if (panes && typeof panes.openSlug === 'function') {
+    try {
+      panes.openSlug(value, anchorCard || null);
+      return true;
+    } catch {
+      // Fall through to the fragment append / navigation fallbacks below.
+    }
+  }
+
+  // Themes that only expose the append helper still get a real pane instead of
+  // a full page load, so the anchor card keeps its edit session.
+  if (panes && typeof panes.appendCardHtml === 'function') {
+    void appendSlugPane(value, anchorCard, panes).then((card) => {
+      if (!card) navigateToSlug(value, anchorCard);
+    });
+    return true;
+  }
+
+  navigateToSlug(value, anchorCard);
+  return false;
+}
+
+/** Fetch a card fragment and append it as a pane after `anchorCard`. */
+async function appendSlugPane(slug, anchorCard, panes) {
+  const wanted = slug.toLowerCase();
+  const existing = allCardPanes().find(
+    (pane) => normaliseSlug(cardSlug(pane)).toLowerCase() === wanted,
+  );
+
+  if (existing) {
+    scrollPaneIntoView(existing);
+    pulseCard(existing);
+    return existing;
+  }
+
+  try {
+    const response = await fetch(`/_zcast/cards/${encodeURIComponent(slug)}`, {
+      method: 'GET',
+      headers: { Accept: 'application/json' },
+      credentials: 'same-origin',
+      cache: 'no-store',
+    });
+
+    if (!response.ok) throw new Error(`Could not open /${slug}`);
+
+    const data = await response.json();
+    if (typeof data?.html !== 'string') throw new Error('Missing card HTML');
+
+    const canonical = normaliseSlug(data.canonical_slug || data.card?.slug || slug);
+    const card = panes.appendCardHtml(
+      anchorCard,
+      data.html,
+      canonical,
+      data.card?.title || '',
+    );
+
+    if (card) {
+      hydrateCardToolbar(card);
+      pulseCard(card);
+    }
+
+    return card || null;
+  } catch {
+    return null;
+  }
+}
+
+/** Last-resort fallback: flush any pending edits, then navigate. */
+function navigateToSlug(slug, anchorCard = null) {
+  const state = anchorCard ? editorStates.get(anchorCard) : null;
+  const go = () => window.location.assign(`/${encodeURIComponent(slug)}`);
+
+  if (state?.editing) void flushSave(state).then(go, go);
+  else go();
+}
+
+/**
+ * Follow a `[[wikilink]]` while staying in edit mode: resolved notes slide open
+ * in a pane to the right, unresolved titles open a pre-titled draft pane.
+ */
+async function navigateWikilinkTarget(targetTitle, anchorCard = null) {
+  const clean = normaliseTitle(targetTitle);
+  if (!clean) return null;
+
+  const slug = await resolveWikilinkSlug(clean);
+  if (!slug) return openDraftForTitle(clean, anchorCard);
+
+  openSlugInPane(slug, anchorCard);
+  return slug;
 }
 
 /* -------------------------------------------------------------------------- */
@@ -782,6 +1015,8 @@ function mountEditor(state, focusMode, options = {}) {
         autocapitalize: 'off',
       },
       handleKeyDown: (_view, event) => handleEditorKeyDown(state, event),
+      handleClick: (view, pos, event) =>
+        handleEditorWikilinkClick(state, view, pos, event),
     },
     onUpdate: ({ editor: current }) => {
       if (!state.editing) return;
@@ -835,7 +1070,7 @@ async function exitEdit(state, options = {}) {
   if (discard && state.saving && state.savePromise) await state.savePromise;
 
   // An untouched draft never hits POST /_zcast/api/notes (issue #4).
-  if (!discard) await flushSave(state);
+  if (!discard && !options.skipSave) await flushSave(state);
 
   state.editing = false;
   liveStates.delete(state);
@@ -854,11 +1089,7 @@ async function exitEdit(state, options = {}) {
 
   if (discard) {
     editorStates.delete(card);
-    card.remove();
-    syncDraftActiveState();
-    if (typeof window.ZcastPanes?.rebuildBreadcrumbs === 'function') {
-      window.ZcastPanes.rebuildBreadcrumbs();
-    }
+    closeCardPane(card);
     return;
   }
 
@@ -1070,6 +1301,163 @@ async function performSave(state) {
 
   applyPrivateButton(state.card, state.private);
   syncDraftActiveState();
+
+  // Hot-swap this card's own footer so a brand-new note immediately shows its
+  // own "Linked from" backlinks, then refresh every other open pane.
+  if (typeof data.card_html === 'string' && data.card_html) {
+    applyFreshCardParts(state.card, data.card_html, {
+      rendered_html: typeof data.rendered_html === 'string' ? data.rendered_html : undefined,
+    });
+  }
+
+  void refreshOpenPanes(state.card);
+  return true;
+}
+
+/* -------------------------------------------------------------------------- */
+/* Real-time cross-pane refresh                                               */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Swap fresh SSR fragments into an open pane. The footer ("Linked from") is
+ * always refreshed; the body only when the pane is not mid-edit, and an active
+ * editor only has its cached HTML updated so typing is never clobbered.
+ */
+function applyFreshCardParts(card, cardHtml, cardData = null, options = {}) {
+  if (!card || typeof cardHtml !== 'string' || !cardHtml) return;
+
+  const replaceBody = Boolean(options.replaceBody);
+
+  const template = document.createElement('template');
+  template.innerHTML = cardHtml;
+
+  const freshFooter = template.content.querySelector('[data-zcast-card-footer]');
+  const freshBody = template.content.querySelector('[data-zcast-card-body]');
+  const freshHtml = freshBody ? freshBody.innerHTML : null;
+  const cachedHtml =
+    typeof cardData?.rendered_html === 'string' ? cardData.rendered_html : freshHtml;
+
+  const footer = card.querySelector('[data-zcast-card-footer]');
+  if (footer && freshFooter) footer.innerHTML = freshFooter.innerHTML;
+
+  const state = editorStates.get(card);
+
+  if (state?.editing && !replaceBody) {
+    // Never touch the live TipTap DOM while the user is typing: just keep the
+    // cached HTML fresh so exiting edit mode renders the new content.
+    if (typeof cachedHtml === 'string') {
+      state.renderedHtml = cachedHtml;
+      state.originalHtml = cachedHtml;
+    }
+    return;
+  }
+
+  if (!replaceBody) return;
+
+  const body = card.querySelector('[data-zcast-card-body]');
+  if (body && typeof freshHtml === 'string') body.innerHTML = freshHtml;
+
+  if (state && !state.editing && typeof cachedHtml === 'string') {
+    state.renderedHtml = cachedHtml;
+    state.originalHtml = cachedHtml;
+  }
+}
+
+/**
+ * After a save, re-fetch every other open pane (in parallel) so renamed
+ * titles, freshly resolved `[[links]]` and "Linked from" backlinks update
+ * without a page refresh.
+ */
+async function refreshOpenPanes(excludeCard = null) {
+  const panes = allCardPanes().filter((pane) => {
+    if (pane === excludeCard) return false;
+    // A pane with no id is an unsaved draft: it has nothing to refresh.
+    if (pane.dataset.zcastDraft === 'true' && !cardId(pane)) return false;
+    return Boolean(cardSlug(pane));
+  });
+
+  if (panes.length === 0) return;
+
+  const results = await Promise.allSettled(
+    panes.map(async (pane) => {
+      const slug = cardSlug(pane);
+      const response = await fetch(`/_zcast/cards/${encodeURIComponent(slug)}`, {
+        method: 'GET',
+        headers: { Accept: 'application/json' },
+        credentials: 'same-origin',
+        cache: 'no-store',
+      });
+
+      if (!response.ok) throw new Error(`Could not refresh /${slug}`);
+
+      const data = await response.json();
+      return { pane, slug, data };
+    }),
+  );
+
+  let slugChanged = false;
+
+  for (const result of results) {
+    if (result.status !== 'fulfilled') continue;
+
+    const { pane, slug, data } = result.value;
+    if (!pane.isConnected || !data || typeof data.html !== 'string') continue;
+
+    const canonical = normaliseSlug(data.canonical_slug || data.card?.slug || slug);
+    if (canonical && canonical !== slug) {
+      pane.dataset.zcastCardSlug = canonical;
+      slugChanged = true;
+    }
+
+    applyFreshCardParts(pane, data.html, data.card, {
+      replaceBody: !editorStates.get(pane)?.editing,
+    });
+  }
+
+  if (slugChanged && typeof window.ZcastPanes?.rebuildBreadcrumbs === 'function') {
+    window.ZcastPanes.rebuildBreadcrumbs();
+  }
+}
+
+/**
+ * Delete a note (future `[data-zcast-delete-note]` hook) and re-sync the panes
+ * that were linking to it.
+ */
+async function deleteNote(card) {
+  if (!card) return false;
+
+  const state = editorStates.get(card);
+  const id = state?.note?.id || cardId(card);
+
+  if (!id) {
+    // Never saved, so there is nothing to DELETE: just drop the draft pane.
+    return discardDraft(card);
+  }
+
+  try {
+    const response = await fetch(`${API_NOTES}/${encodeURIComponent(id)}`, {
+      method: 'DELETE',
+      headers: { Accept: 'application/json' },
+      credentials: 'same-origin',
+    });
+
+    if (!response.ok && response.status !== 404) {
+      throw new Error(`Delete failed with status ${response.status}`);
+    }
+  } catch (error) {
+    setStatus(card, `Delete failed: ${errorMessage(error)}`, 'error');
+    return false;
+  }
+
+  await refreshOpenPanes(card);
+
+  if (state?.editing) {
+    state.dirty = false;
+    await exitEdit(state, { discard: true });
+  } else {
+    closeCardPane(card);
+  }
+
   return true;
 }
 
@@ -1197,6 +1585,122 @@ function handleEditorKeyDown(state, event) {
   return false;
 }
 
+/** `Cmd+Click` / `Ctrl+Click` on a `[[wikilink]]` follows it in-pane. */
+function handleEditorWikilinkClick(state, view, pos, event) {
+  if (!(event.metaKey || event.ctrlKey)) return false;
+
+  const element = eventElement(event);
+  const decoration = element?.closest?.('.zcast-wikilink-text') || null;
+
+  let link = findWikilinkAtPos(view.state.doc, pos);
+
+  if (!link && decoration) {
+    // ProseMirror occasionally reports a position just outside the decoration.
+    try {
+      const from = view.posAtDOM(decoration, 0);
+      link =
+        findWikilinkAtPos(view.state.doc, from) ||
+        findWikilinkAtPos(view.state.doc, from + 1);
+    } catch {
+      link = null;
+    }
+  }
+
+  if (!link) return false;
+
+  event.preventDefault();
+  event.stopPropagation();
+  void navigateWikilinkTarget(link.target, state.card);
+  return true;
+}
+
+/* -------------------------------------------------------------------------- */
+/* Closing panes                                                              */
+/* -------------------------------------------------------------------------- */
+
+/** Scroll back to the new rightmost pane, then re-sync breadcrumbs/`?stack=`. */
+function syncPanesAfterClose() {
+  const panes = window.ZcastPanes;
+  const cards = allCardPanes();
+  const last = cards[cards.length - 1] || null;
+
+  if (last) scrollPaneIntoView(last);
+
+  if (last && panes && typeof panes.updateCardMeta === 'function') {
+    try {
+      // Empty slug/title still re-syncs breadcrumbs, <title> and the URL stack.
+      panes.updateCardMeta(last, '', '');
+      return;
+    } catch {
+      // Fall through to breadcrumbs only.
+    }
+  }
+
+  if (typeof panes?.rebuildBreadcrumbs === 'function') panes.rebuildBreadcrumbs();
+}
+
+/** Remove one pane, preferring the theme helper and falling back to the DOM. */
+function closeCardPane(card) {
+  if (!card) return false;
+
+  const panes = window.ZcastPanes;
+  if (panes && typeof panes.closePane === 'function') {
+    try {
+      panes.closePane(card);
+      editorStates.delete(card);
+      syncDraftActiveState();
+      return true;
+    } catch {
+      // Fall through to the DOM fallback below.
+    }
+  }
+
+  card.remove();
+  editorStates.delete(card);
+  syncDraftActiveState();
+  syncPanesAfterClose();
+  return true;
+}
+
+/**
+ * Close a pane from its × chrome. Editor panes flush their pending autosave
+ * first, so a stray click can never lose typing; blank drafts are dropped.
+ */
+async function closeEditorPane(card) {
+  if (!card) return false;
+
+  // The root/leftmost card is the reading anchor: never close it.
+  if (allCardPanes().indexOf(card) <= 0) return false;
+
+  const state = editorStates.get(card);
+
+  if (state?.editing) {
+    const unsavedDraft = Boolean(state.draft) && !state.note?.id;
+
+    if (unsavedDraft && draftIsEmptyState(state)) {
+      await exitEdit(state, { discard: true });
+      return true;
+    }
+
+    const saved = await flushSave(state);
+    if (!saved) {
+      setStatus(card, 'Save failed - keeping pane open', 'error');
+      return false;
+    }
+
+    state.dirty = false;
+    await exitEdit(state, { skipSave: true });
+    closeCardPane(card);
+    return true;
+  }
+
+  if (card.dataset.zcastDraft === 'true' && !cardId(card)) {
+    return discardDraft(card);
+  }
+
+  return false;
+}
+
 /* -------------------------------------------------------------------------- */
 /* Floating selection toolbar                                                 */
 /* -------------------------------------------------------------------------- */
@@ -1215,6 +1719,8 @@ const TOOLBAR_ACTIONS = [
   ['code', 'Code', 'Inline code', 'zcast-toolbar-code'],
   ['sep'],
   ['wikilink', '[[Link]]', 'Wrap selection in a wikilink', 'zcast-toolbar-wikilink'],
+  ['sep', '', '', 'zcast-toolbar-sep-open'],
+  ['openWikilink', 'Open ↗', 'Open the linked note in a pane to the right', 'zcast-toolbar-open-link'],
 ];
 
 function ensureFloatingToolbar() {
@@ -1223,10 +1729,14 @@ function ensureFloatingToolbar() {
   const toolbar = document.createElement('div');
   toolbar.className = 'zcast-editor-toolbar';
   toolbar.hidden = true;
+  toolbar.dataset.mode = 'selection';
   toolbar.setAttribute('role', 'toolbar');
   toolbar.setAttribute('aria-label', 'Text formatting');
   toolbar.innerHTML = TOOLBAR_ACTIONS.map(([action, label, title, className]) => {
-    if (action === 'sep') return '<span class="zcast-toolbar-sep" aria-hidden="true"></span>';
+    if (action === 'sep') {
+      const extra = className ? ` ${className}` : '';
+      return `<span class="zcast-toolbar-sep${extra}" aria-hidden="true"></span>`;
+    }
     return `<button type="button" class="zcast-toolbar-btn ${className}" data-zcast-action="${action}" title="${escapeHtml(title)}" aria-label="${escapeHtml(title)}">${escapeHtml(label)}</button>`;
   }).join('');
 
@@ -1245,6 +1755,14 @@ function ensureFloatingToolbar() {
 function runToolbarAction(state, action) {
   const editor = state.editor;
   if (!editor) return;
+
+  // Following a link must not refocus the editor first: that would collapse a
+  // multi-character selection before we know which target we are opening.
+  if (action === 'openWikilink') {
+    const link = toolbarWikilink(state);
+    if (link) void navigateWikilinkTarget(link.target, state.card);
+    return;
+  }
 
   const chain = editor.chain().focus();
 
@@ -1309,20 +1827,36 @@ function updateFloatingToolbar(state) {
     return;
   }
 
+  // The [[wikilink]] autocomplete owns the caret while it is open.
+  if (autocomplete.open && autocomplete.state === state) {
+    hideFloatingToolbar();
+    return;
+  }
+
+  const editor = state.editor;
   const selection = window.getSelection();
-  if (!selection || selection.rangeCount === 0 || selection.isCollapsed) {
+  if (!selection || selection.rangeCount === 0) {
     hideFloatingToolbar();
     return;
   }
 
   const range = selection.getRangeAt(0);
-  const editorDom = state.editor.view.dom;
+  const editorDom = editor.view.dom;
   if (!editorDom.contains(range.commonAncestorContainer)) {
     hideFloatingToolbar();
     return;
   }
 
-  const rect = range.getBoundingClientRect();
+  const collapsed = editor.state.selection.empty;
+  const link = toolbarWikilink(state);
+
+  // A bare caret only earns a toolbar while it sits inside a [[wikilink]].
+  if (collapsed && !link) {
+    hideFloatingToolbar();
+    return;
+  }
+
+  const rect = collapsed ? wikilinkRect(editor, link) : range.getBoundingClientRect();
   if (!rect || (rect.width === 0 && rect.height === 0)) {
     hideFloatingToolbar();
     return;
@@ -1331,8 +1865,68 @@ function updateFloatingToolbar(state) {
   const toolbar = ensureFloatingToolbar();
   toolbarOwner = state;
   toolbar.hidden = false;
+  syncToolbarVisibility({ link, collapsed });
   syncToolbarState(state);
   positionToolbar(toolbar, rect);
+}
+
+/** The `[[wikilink]]` the current editor selection covers or sits inside. */
+function toolbarWikilink(state) {
+  const editor = state?.editor;
+  if (!editor) return null;
+
+  const { from, to } = editor.state.selection;
+  return findWikilinkInRange(editor.state.doc, from, to);
+}
+
+/** Collapsed-caret mode: only `Open ↗`, nothing else. */
+function syncToolbarVisibility({ link = null, collapsed = false } = {}) {
+  if (!floatingToolbar) return;
+
+  floatingToolbar.dataset.mode = collapsed ? 'wikilink-only' : 'selection';
+
+  if (link) floatingToolbar.dataset.zcastWikilinkTarget = link.target;
+  else delete floatingToolbar.dataset.zcastWikilinkTarget;
+
+  const showOpen = Boolean(link);
+
+  floatingToolbar.querySelectorAll('[data-zcast-action]').forEach((button) => {
+    if (button.dataset.zcastAction === 'openWikilink') {
+      button.hidden = !showOpen;
+      return;
+    }
+    button.hidden = collapsed;
+  });
+
+  floatingToolbar.querySelectorAll('.zcast-toolbar-sep').forEach((separator) => {
+    const openSeparator = separator.classList.contains('zcast-toolbar-sep-open');
+    separator.hidden = collapsed || (openSeparator && !showOpen);
+  });
+}
+
+/** Bounding rect (viewport coordinates) of a wikilink's text range. */
+function wikilinkRect(editor, link) {
+  if (!link) return null;
+
+  try {
+    const start = editor.view.coordsAtPos(link.from);
+    const end = editor.view.coordsAtPos(link.to);
+    const top = Math.min(start.top, end.top);
+    const bottom = Math.max(start.bottom, end.bottom);
+    const left = Math.min(start.left, end.left);
+    const right = Math.max(start.right, end.right);
+
+    return {
+      top,
+      bottom,
+      left,
+      right,
+      width: Math.max(0, right - left),
+      height: Math.max(0, bottom - top),
+    };
+  } catch {
+    return null;
+  }
 }
 
 function positionToolbar(toolbar, rect) {
@@ -1380,20 +1974,10 @@ function hideFloatingToolbar() {
 }
 
 function repositionFloatingToolbar() {
-  if (!toolbarOwner?.editor || !floatingToolbar || floatingToolbar.hidden) return;
-  const selection = window.getSelection();
-  if (!selection || selection.rangeCount === 0 || selection.isCollapsed) {
-    hideFloatingToolbar();
-    return;
-  }
-
-  const range = selection.getRangeAt(0);
-  if (!toolbarOwner.editor.view.dom.contains(range.commonAncestorContainer)) {
-    hideFloatingToolbar();
-    return;
-  }
-
-  positionToolbar(floatingToolbar, range.getBoundingClientRect());
+  if (!toolbarOwner || !floatingToolbar || floatingToolbar.hidden) return;
+  // Recompute rather than just reposition: scroll can move a collapsed caret
+  // out of its [[wikilink]], and the compact pill must follow it cleanly.
+  updateFloatingToolbar(toolbarOwner);
 }
 
 /* -------------------------------------------------------------------------- */
@@ -1428,6 +2012,13 @@ function refreshAutocomplete(state) {
   }
 
   if (state.editor.isActive('code') || state.editor.isActive('codeBlock')) {
+    hideAutocomplete(state);
+    return;
+  }
+
+  // Inside a closed [[wikilink]] the autocomplete must not fight the "Open ↗"
+  // affordance: only offer suggestions for a fresh, still-unclosed link.
+  if (findWikilinkAtPos(state.editor.state.doc, state.editor.state.selection.from)) {
     hideAutocomplete(state);
     return;
   }
@@ -1689,6 +2280,7 @@ function hideAutocomplete(state = null) {
 function draftCardHtml(title, token) {
   const safeTitle = escapeHtml(title || '');
   return `<article class="zcast-card zcast-card-draft zcast-card--entering" data-zcast-card data-zcast-card-id="" data-zcast-card-slug="" data-zcast-card-private="false" data-zcast-card-admin="true" data-zcast-draft="true" data-zcast-draft-token="${token}">
+    <button type="button" class="zcast-card__close" data-zcast-close-pane aria-label="Close pane" title="Close pane">&times;</button>
     <div class="zcast-card__toolbar" data-zcast-card-toolbar>
       <button type="button" class="zcast-btn zcast-btn-edit" data-zcast-edit-toggle data-zcast-card-id="" aria-pressed="false" title="Edit note">Edit</button>
       <button type="button" class="zcast-btn zcast-btn-private" data-zcast-private-toggle data-zcast-card-id="" data-private="false" aria-pressed="false" title="Public note - click to make private">Public</button>
@@ -1830,20 +2422,17 @@ async function openDraftPane(title, anchor = null) {
 }
 
 async function discardDraft(card) {
-  if (!card) return;
+  if (!card) return false;
 
   const state = editorStates.get(card);
   if (state?.editing) {
     await exitEdit(state, { discard: true });
-    return;
+    return true;
   }
 
   editorStates.delete(card);
-  card.remove();
-  syncDraftActiveState();
-  if (typeof window.ZcastPanes?.rebuildBreadcrumbs === 'function') {
-    window.ZcastPanes.rebuildBreadcrumbs();
-  }
+  closeCardPane(card);
+  return true;
 }
 
 /* -------------------------------------------------------------------------- */
@@ -1866,6 +2455,23 @@ function handleDocumentClick(event) {
     return;
   }
 
+  const closeButton = element.closest('[data-zcast-close-pane]');
+  if (closeButton) {
+    const card = cardFor(closeButton);
+    const state = card ? editorStates.get(card) : null;
+    const unsavedDraft = Boolean(card) && card.dataset.zcastDraft === 'true' && !cardId(card);
+
+    // Saved, non-editing cards fall through cleanly to panes.js below; only
+    // editor panes and drafts need the flush-before-close dance.
+    if (card && (state?.editing || unsavedDraft)) {
+      if (allCardPanes().indexOf(card) <= 0) return;
+      event.preventDefault();
+      event.stopPropagation();
+      void closeEditorPane(card);
+      return;
+    }
+  }
+
   const discardButton = element.closest('[data-zcast-discard-draft]');
   if (discardButton) {
     const card = cardFor(discardButton);
@@ -1873,6 +2479,17 @@ function handleDocumentClick(event) {
       event.preventDefault();
       event.stopPropagation();
       void discardDraft(card);
+    }
+    return;
+  }
+
+  const deleteButton = element.closest('[data-zcast-delete-note]');
+  if (deleteButton) {
+    const card = cardFor(deleteButton);
+    if (card) {
+      event.preventDefault();
+      event.stopPropagation();
+      void deleteNote(card);
     }
     return;
   }

@@ -331,11 +331,17 @@ async fn get_card_fragment(
     let html = kernel.render_card_html(&card, is_admin);
     let canonical_slug = card.slug.clone();
 
-    Ok(Json(CardFragmentResponse {
-        card,
-        html,
-        canonical_slug,
-    }))
+    // Card fragments are hot-swapped by the inline editor after every save, so
+    // browsers must never serve them from cache: a cached fragment would show
+    // stale backlinks or rendered body HTML until a hard refresh.
+    Ok((
+        [(header::CACHE_CONTROL, HeaderValue::from_static("no-store"))],
+        Json(CardFragmentResponse {
+            card,
+            html,
+            canonical_slug,
+        }),
+    ))
 }
 
 async fn list_notes_api(
