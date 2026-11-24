@@ -201,6 +201,16 @@ enum ModuleAction {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Re-enable a previously deactivated bundled module (no rebuild needed)
+    Activate {
+        /// Module ID (e.g. zcast-search-onnx, zcast-popover)
+        name: String,
+    },
+    /// Deactivate a bundled module without removing it from the lock file
+    Deactivate {
+        /// Module ID (e.g. zcast-search-fts, zcast-popover)
+        name: String,
+    },
     /// Remove an extra module crate from zcast-modules.toml and rebuild
     Remove {
         /// Crate/module name to remove
@@ -239,7 +249,9 @@ enum AuthAction {
     },
 }
 
-async fn connect_storage(database_url: &str) -> Result<Arc<dyn Storage>, Box<dyn std::error::Error>> {
+async fn connect_storage(
+    database_url: &str,
+) -> Result<Arc<dyn Storage>, Box<dyn std::error::Error>> {
     if database_url.trim().starts_with("mysql://") {
         let mysql = MysqlStorage::connect(database_url).await?;
         Ok(Arc::new(mysql))
@@ -280,6 +292,7 @@ fn load_or_default_module_lock(path: &Path) -> modules::ModuleLockConfig {
         core_version: env!("CARGO_PKG_VERSION").to_owned(),
         bindings: BTreeMap::new(),
         extra_crates: Vec::new(),
+        disabled: Vec::new(),
     }
 }
 
@@ -292,6 +305,34 @@ fn build_search_provider(choice: &str) -> Result<Option<Arc<dyn SearchProvider>>
             "unknown search provider '{other}' (expected 'fts', 'onnx', or 'none')"
         )),
     }
+}
+
+/// Resolve the effective search choice, honouring deactivated modules.
+///
+/// A CLI `--search` flag always wins (explicit intent). Otherwise the configured
+/// value is used unless that provider has been deactivated, in which case the
+/// lock file's active search binding (if any) takes over.
+fn resolve_search_choice(
+    explicit: bool,
+    configured: Option<&str>,
+    lock_cfg: &modules::ModuleLockConfig,
+) -> String {
+    let configured = configured.map(str::trim).filter(|s| !s.is_empty());
+    if explicit {
+        return configured.unwrap_or("fts").to_owned();
+    }
+    if let Some(choice) = configured {
+        if matches!(choice.to_ascii_lowercase().as_str(), "none" | "off") {
+            return "none".to_owned();
+        }
+        if !lock_cfg.is_disabled(modules::normalize_search_module_id(choice)) {
+            return choice.to_owned();
+        }
+    }
+    lock_cfg
+        .active_search_module()
+        .map(str::to_owned)
+        .unwrap_or_else(|| "none".to_owned())
 }
 
 fn canonical_interface_name(raw: &str) -> &'static str {
@@ -309,40 +350,63 @@ fn canonical_interface_name(raw: &str) -> &'static str {
     }
 }
 
+/// Print the deactivated-module section for `module list` / `module graph`.
+fn print_deactivated_modules(lock_cfg: &modules::ModuleLockConfig) {
+    if lock_cfg.disabled.is_empty() {
+        return;
+    }
+    println!("\nDeactivated Modules:");
+    for name in &lock_cfg.disabled {
+        println!("  - {name}");
+        println!("    (re-enable with: zcast module activate {name})");
+    }
+}
+
 async fn build_introspection_kernel(
     config: KernelConfig,
+    lock_cfg: &modules::ModuleLockConfig,
 ) -> Result<Arc<zcast_kernel::ZcastKernel>, Box<dyn std::error::Error>> {
     let storage = Arc::new(SqliteStorage::connect("sqlite::memory:").await?);
     let links = Arc::new(WikilinkParser::new());
     let theme = Arc::new(DavidHewitsonTheme::new());
-    let editor = Arc::new(InlineEditor::new());
-    let search_choice = config.search.as_deref().unwrap_or("fts");
-    let popover = Arc::new(HoverPopover::new());
-    let io = Arc::new(MarkdownIo::new());
 
-    let mut builder = ZcastKernelBuilder::new(config.clone(), storage.clone(), links, theme)
-        .with_editor(editor)
-        .with_ui_extension(popover)
-        .with_exporter(io.clone())
-        .with_importer(io);
+    let mut builder = ZcastKernelBuilder::new(config.clone(), storage.clone(), links, theme);
 
-    if let Some(search) = build_search_provider(search_choice)? {
-        builder = builder
-            .with_search(search)
-            .with_ui_extension(Arc::new(CommandBar::new()));
+    if !lock_cfg.is_disabled("zcast-editor-inline") {
+        builder = builder.with_editor(Arc::new(InlineEditor::new()));
+    }
+    if !lock_cfg.is_disabled("zcast-popover") {
+        builder = builder.with_ui_extension(Arc::new(HoverPopover::new()));
+    }
+    if !lock_cfg.is_disabled("zcast-io-markdown") {
+        let io = Arc::new(MarkdownIo::new());
+        builder = builder.with_exporter(io.clone()).with_importer(io);
     }
 
-    match config.auth.as_deref().unwrap_or("basic") {
-        "magic-link" | "zcast-auth-magic-link" => {
-            let email = config
-                .admin_email
-                .clone()
-                .unwrap_or_else(|| "admin@localhost".to_owned());
-            builder = builder.with_auth(Arc::new(MagicLinkAuthProvider::new(storage, email)));
+    let search_choice = resolve_search_choice(false, config.search.as_deref(), lock_cfg);
+    if let Some(search) = build_search_provider(&search_choice)? {
+        builder = builder.with_search(search);
+        if !lock_cfg.is_disabled("zcast-cmd-k") {
+            builder = builder.with_ui_extension(Arc::new(CommandBar::new()));
         }
-        "none" => {}
-        _ => {
-            builder = builder.with_auth(Arc::new(BasicAuthProvider::new(storage)));
+    }
+
+    let auth_mode = config.auth.as_deref().unwrap_or("basic");
+    let auth_disabled = modules::normalize_auth_module_id(auth_mode)
+        .is_some_and(|module| lock_cfg.is_disabled(module));
+    if !auth_disabled {
+        match auth_mode {
+            "magic-link" | "zcast-auth-magic-link" => {
+                let email = config
+                    .admin_email
+                    .clone()
+                    .unwrap_or_else(|| "admin@localhost".to_owned());
+                builder = builder.with_auth(Arc::new(MagicLinkAuthProvider::new(storage, email)));
+            }
+            "none" => {}
+            _ => {
+                builder = builder.with_auth(Arc::new(BasicAuthProvider::new(storage)));
+            }
         }
     }
 
@@ -429,6 +493,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             search,
             allow_unauthenticated_public,
         } => {
+            let search_explicit = search.is_some();
+            let auth_explicit = auth.is_some();
+
             if let Some(b) = bind {
                 config.bind_addr = b;
             }
@@ -476,26 +543,38 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         "none".to_owned()
                     }
                 });
+            // A deactivated auth module is skipped unless the CLI asked for it.
+            let auth_mode = match modules::normalize_auth_module_id(&auth_mode) {
+                Some(module) if !auth_explicit && lock_cfg.is_disabled(module) => "none".to_owned(),
+                _ => auth_mode,
+            };
 
-            let search_mode = config.search.as_deref().unwrap_or("fts").to_owned();
+            let search_mode =
+                resolve_search_choice(search_explicit, config.search.as_deref(), &lock_cfg);
 
             let storage = connect_storage(&config.database_url).await?;
             let links = Arc::new(WikilinkParser::new());
             let theme = Arc::new(DavidHewitsonTheme::new());
-            let editor = Arc::new(InlineEditor::new());
-            let popover = Arc::new(HoverPopover::new());
-            let io = Arc::new(MarkdownIo::new());
 
-            let mut builder = ZcastKernelBuilder::new(config.clone(), storage.clone(), links, theme)
-                .with_editor(editor)
-                .with_ui_extension(popover)
-                .with_exporter(io.clone())
-                .with_importer(io);
+            let mut builder =
+                ZcastKernelBuilder::new(config.clone(), storage.clone(), links, theme);
+
+            if !lock_cfg.is_disabled("zcast-editor-inline") {
+                builder = builder.with_editor(Arc::new(InlineEditor::new()));
+            }
+            if !lock_cfg.is_disabled("zcast-popover") {
+                builder = builder.with_ui_extension(Arc::new(HoverPopover::new()));
+            }
+            if !lock_cfg.is_disabled("zcast-io-markdown") {
+                let io = Arc::new(MarkdownIo::new());
+                builder = builder.with_exporter(io.clone()).with_importer(io);
+            }
 
             if let Some(search_provider) = build_search_provider(&search_mode)? {
-                builder = builder
-                    .with_search(search_provider)
-                    .with_ui_extension(Arc::new(CommandBar::new()));
+                builder = builder.with_search(search_provider);
+                if !lock_cfg.is_disabled("zcast-cmd-k") {
+                    builder = builder.with_ui_extension(Arc::new(CommandBar::new()));
+                }
             }
 
             let mut basic_auth: Option<Arc<BasicAuthProvider>> = None;
@@ -672,7 +751,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     "   Auth:      magic-link ({})",
                     opts.admin_email.as_deref().unwrap_or("admin@localhost")
                 );
-                println!("   Recovery:  zcast --config {} auth login-link", opts.config_path.display());
+                println!(
+                    "   Recovery:  zcast --config {} auth login-link",
+                    opts.config_path.display()
+                );
             }
 
             if opts.production
@@ -717,11 +799,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             let target_version = match version {
                 Some(v) => v,
-                None => fetch_latest_release_tag(&repo)
-                    .unwrap_or_else(|_| format!("v{current}")),
+                None => fetch_latest_release_tag(&repo).unwrap_or_else(|_| format!("v{current}")),
             };
 
-            let plan = update::build_update_plan(&repo, current, &target_version, has_custom_modules);
+            let plan =
+                update::build_update_plan(&repo, current, &target_version, has_custom_modules);
 
             println!("zcast update plan:");
             println!("  Current version: v{}", plan.current_version);
@@ -823,7 +905,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .is_ok_and(|s| s.success());
                 if !ok {
                     modules::rollback_binary(&prev, &current_exe)?;
-                    return Err("updated binary failed verification; rolled back to previous binary".into());
+                    return Err(
+                        "updated binary failed verification; rolled back to previous binary".into(),
+                    );
                 }
 
                 println!(
@@ -836,7 +920,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         Commands::Module { action } => match action {
             ModuleAction::List => {
-                let kernel = build_introspection_kernel(config).await?;
+                let kernel = build_introspection_kernel(config, &lock_cfg).await?;
                 let snap = kernel.registry_snapshot();
 
                 println!("Compiled Modules:");
@@ -875,14 +959,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         b.interface, b.module_id, b.module_version
                     );
                 }
+                print_deactivated_modules(&lock_cfg);
             }
             ModuleAction::Graph { json } => {
-                let kernel = build_introspection_kernel(config).await?;
+                let kernel = build_introspection_kernel(config, &lock_cfg).await?;
                 let snap = kernel.registry_snapshot();
                 if json {
                     println!("{}", serde_json::to_string_pretty(&snap)?);
                 } else {
                     print!("{}", modules::render_module_graph_ascii(&snap));
+                    print_deactivated_modules(&lock_cfg);
                 }
             }
             ModuleAction::Bind {
@@ -899,10 +985,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let mut updated = lock_cfg.clone();
                 updated.bindings.insert(iface.to_owned(), module_id.clone());
                 updated.save(&lock_path)?;
-                println!(
-                    "Bound {iface} -> {module_id} in {}",
-                    lock_path.display()
-                );
+                println!("Bound {iface} -> {module_id} in {}", lock_path.display());
             }
             ModuleAction::Install {
                 spec,
@@ -910,9 +993,35 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 dry_run,
             } => {
                 let parsed = modules::parse_module_spec(&spec)?;
+
+                // Bundled modules are already compiled in: just re-enable them.
+                if parsed.git.is_none()
+                    && parsed.path.is_none()
+                    && parsed.version.is_none()
+                    && modules::is_bundled_module(&parsed.name)
+                {
+                    let mut updated = lock_cfg.clone();
+                    let msg = updated.activate_module(&parsed.name)?;
+                    if dry_run {
+                        println!(
+                            "Dry-run complete: {msg} (no recompile needed; {} unchanged)",
+                            lock_path.display()
+                        );
+                    } else {
+                        updated.save(&lock_path)?;
+                        println!(
+                            "Activated bundled module '{}' in {}.",
+                            parsed.name,
+                            lock_path.display()
+                        );
+                    }
+                    return Ok(());
+                }
+
                 let mut updated = lock_cfg.clone();
                 updated.extra_crates.retain(|c| c.name != parsed.name);
                 updated.extra_crates.push(parsed.clone());
+                updated.disabled.retain(|c| c != &parsed.name);
 
                 let build_dir = config
                     .data_dir
@@ -939,38 +1048,71 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     );
                 }
             }
+            ModuleAction::Activate { name } => {
+                let mut updated = lock_cfg.clone();
+                let msg = updated.activate_module(&name)?;
+                updated.save(&lock_path)?;
+                println!("{msg}");
+            }
+            ModuleAction::Deactivate { name } => {
+                let mut updated = lock_cfg.clone();
+                let msg = updated.deactivate_module(&name)?;
+                updated.save(&lock_path)?;
+                println!("{msg}");
+            }
             ModuleAction::Remove {
                 name,
                 jobs,
                 dry_run,
             } => {
                 let mut updated = lock_cfg.clone();
-                let before = updated.extra_crates.len();
-                updated.extra_crates.retain(|c| c.name != name);
-                if updated.extra_crates.len() == before {
-                    return Err(format!("module '{name}' is not in {}", lock_path.display()).into());
-                }
 
-                let build_dir = config
-                    .data_dir
-                    .clone()
-                    .unwrap_or_else(|| PathBuf::from(".zcast-build"));
-                let bin = modules::build_custom_binary(&build_dir, &updated, jobs, dry_run)?;
-                updated.save(&lock_path)?;
+                if updated.extra_crates.iter().any(|c| c.name == name) {
+                    updated.extra_crates.retain(|c| c.name != name);
+                    updated.disabled.retain(|c| c != &name);
 
-                if dry_run {
-                    println!(
-                        "Dry-run complete: removed '{name}' from {} and refreshed shim in {}",
-                        lock_path.display(),
-                        build_dir.display()
-                    );
+                    let build_dir = config
+                        .data_dir
+                        .clone()
+                        .unwrap_or_else(|| PathBuf::from(".zcast-build"));
+                    let bin = modules::build_custom_binary(&build_dir, &updated, jobs, dry_run)?;
+                    updated.save(&lock_path)?;
+
+                    if dry_run {
+                        println!(
+                            "Dry-run complete: removed '{name}' from {} and refreshed shim in {}",
+                            lock_path.display(),
+                            build_dir.display()
+                        );
+                    } else {
+                        let current_exe = std::env::current_exe()?;
+                        let prev = modules::atomic_swap_binary(&bin, &current_exe)?;
+                        println!(
+                            "Removed '{name}' and swapped binary atomically (previous kept at {})",
+                            prev.display()
+                        );
+                    }
+                } else if modules::is_mandatory_module(&name) {
+                    return Err(format!(
+                        "module '{name}' is mandatory and cannot be removed (swap it instead via 'zcast module bind <interface> <replacement>')"
+                    )
+                    .into());
+                } else if modules::is_optional_bundled_module(&name) {
+                    let msg = updated.deactivate_module(&name)?;
+                    if dry_run {
+                        println!("Dry-run complete: {msg} (no recompile needed)");
+                    } else {
+                        updated.save(&lock_path)?;
+                        println!(
+                            "Removed (deactivated) bundled module '{name}' in {}. Restart zcast to apply, or re-enable anytime with 'zcast module activate {name}'.",
+                            lock_path.display()
+                        );
+                    }
                 } else {
-                    let current_exe = std::env::current_exe()?;
-                    let prev = modules::atomic_swap_binary(&bin, &current_exe)?;
-                    println!(
-                        "Removed '{name}' and swapped binary atomically (previous kept at {})",
-                        prev.display()
-                    );
+                    return Err(format!(
+                        "unknown module '{name}' (run 'zcast module list' to see installed modules)"
+                    )
+                    .into());
                 }
             }
             ModuleAction::Update { jobs, dry_run } => {
@@ -1042,9 +1184,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let exporter = MarkdownIo::new();
 
             if let Some(zip_path) = zip {
-                let (bytes, summary) = exporter
-                    .export_to_zip_bytes(storage.as_ref(), ctx)
-                    .await?;
+                let (bytes, summary) = exporter.export_to_zip_bytes(storage.as_ref(), ctx).await?;
                 if let Some(parent) = zip_path.parent()
                     && !parent.as_os_str().is_empty()
                 {
@@ -1058,14 +1198,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 );
             } else {
                 let dir = out.unwrap_or_else(|| PathBuf::from("zcast-export"));
-                let summary = exporter
-                    .export_to_dir(storage.as_ref(), &dir, ctx)
-                    .await?;
-                println!(
-                    "Exported {} note(s) to {}",
-                    summary.exported,
-                    dir.display()
-                );
+                let summary = exporter.export_to_dir(storage.as_ref(), &dir, ctx).await?;
+                println!("Exported {} note(s) to {}", summary.exported, dir.display());
             }
         }
 

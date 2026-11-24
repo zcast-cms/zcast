@@ -39,6 +39,65 @@ const CORE_CRATES: &[&str] = &[
     "zcast-theme-davidhewitson",
 ];
 
+/// Modules that a build cannot function without. They can only be swapped for
+/// an equivalent provider via `zcast module bind`, never switched off.
+pub const MANDATORY_MODULES: &[&str] = &[
+    "zcast-storage-sqlite",
+    "zcast-storage-mysql",
+    "zcast-links-wikilink",
+    "zcast-theme-davidhewitson",
+];
+
+/// Bundled modules that ship with zcast and can be deactivated at runtime.
+pub const OPTIONAL_BUNDLED_MODULES: &[&str] = &[
+    "zcast-editor-inline",
+    "zcast-popover",
+    "zcast-cmd-k",
+    "zcast-io-markdown",
+    "zcast-search-fts",
+    "zcast-search-onnx",
+    "zcast-auth-basic",
+    "zcast-auth-magic-link",
+];
+
+/// Search provider used when no `zcast:search/provider` binding is recorded.
+pub const DEFAULT_SEARCH_MODULE: &str = "zcast-search-fts";
+
+/// True when `id` is a bundled module that must stay compiled in.
+pub fn is_mandatory_module(id: &str) -> bool {
+    let id = id.trim();
+    MANDATORY_MODULES.contains(&id)
+}
+
+/// True when `id` is a bundled module that can be deactivated/removed.
+pub fn is_optional_bundled_module(id: &str) -> bool {
+    let id = id.trim();
+    OPTIONAL_BUNDLED_MODULES.contains(&id)
+}
+
+/// True when `id` is any bundled (mandatory or optional) module.
+pub fn is_bundled_module(id: &str) -> bool {
+    is_mandatory_module(id) || is_optional_bundled_module(id)
+}
+
+/// Normalise a search provider choice (`fts`, `onnx`, module ID) to a module ID.
+pub fn normalize_search_module_id(id: &str) -> &str {
+    match id.trim() {
+        "fts" | "zcast-search-fts" => "zcast-search-fts",
+        "onnx" | "semantic" | "zcast-search-onnx" => "zcast-search-onnx",
+        other => other,
+    }
+}
+
+/// Normalise an auth provider choice (`basic`, `magic-link`, module ID) to a module ID.
+pub fn normalize_auth_module_id(id: &str) -> Option<&'static str> {
+    match id.trim() {
+        "basic" | "zcast-auth-basic" => Some("zcast-auth-basic"),
+        "magic-link" | "zcast-auth-magic-link" => Some("zcast-auth-magic-link"),
+        _ => None,
+    }
+}
+
 /// Persisted module selection (`zcast-modules.toml`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModuleLockConfig {
@@ -47,6 +106,9 @@ pub struct ModuleLockConfig {
     pub bindings: BTreeMap<String, String>,
     /// Additional crates compiled into the custom binary.
     pub extra_crates: Vec<ModuleCrateSpec>,
+    /// Bundled modules switched off at runtime (kept compiled, never registered).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub disabled: Vec<String>,
 }
 
 /// A single extra crate compiled into a custom zcast binary.
@@ -62,6 +124,126 @@ pub struct ModuleCrateSpec {
 }
 
 impl ModuleLockConfig {
+    /// True when the bundled module `id` has been deactivated.
+    pub fn is_disabled(&self, id: &str) -> bool {
+        let id = id.trim();
+        if id.is_empty() {
+            return false;
+        }
+        self.disabled.iter().any(|disabled| disabled.trim() == id)
+    }
+
+    /// The search module that will actually be registered at runtime, if any.
+    pub fn active_search_module(&self) -> Option<&str> {
+        let bound = self
+            .bindings
+            .get(zcast_interfaces::IFACE_SEARCH)
+            .map(String::as_str)
+            .map(str::trim)
+            .filter(|bound| !bound.is_empty());
+
+        let candidate = match bound {
+            Some("none") | Some("off") => return None,
+            Some(other) => normalize_search_module_id(other),
+            None => DEFAULT_SEARCH_MODULE,
+        };
+
+        if self.is_disabled(candidate) {
+            None
+        } else {
+            Some(candidate)
+        }
+    }
+
+    /// Deactivate a bundled module (or an already-installed extra crate).
+    pub fn deactivate_module(&mut self, id: &str) -> Result<String, String> {
+        let id = id.trim();
+        if id.is_empty() {
+            return Err("module id cannot be empty".to_owned());
+        }
+        if is_mandatory_module(id) {
+            return Err(format!(
+                "cannot deactivate mandatory module '{id}' (swap it instead via 'zcast module bind <interface> <replacement>')"
+            ));
+        }
+        let is_extra = self.extra_crates.iter().any(|spec| spec.name == id);
+        if !is_optional_bundled_module(id) && !is_extra {
+            return Err(format!(
+                "unknown module '{id}' (run 'zcast module list' to see installed modules)"
+            ));
+        }
+
+        if !self.is_disabled(id) {
+            // Dependency guard: never strand a module that requires a search provider.
+            let mut probe = self.clone();
+            probe.disabled.push(id.to_owned());
+            if self.active_search_module().is_some()
+                && probe.active_search_module().is_none()
+                && !self.is_disabled("zcast-cmd-k")
+            {
+                return Err(format!(
+                    "cannot deactivate '{id}': active module 'zcast-cmd-k' requires 'zcast:search/provider@^1.0' (deactivate 'zcast-cmd-k' first, or switch search via 'zcast module activate zcast-search-onnx')"
+                ));
+            }
+        }
+
+        if self.is_disabled(id) {
+            return Ok(format!("Module '{id}' is already deactivated."));
+        }
+
+        self.disabled.push(id.to_owned());
+        self.disabled.sort();
+        self.disabled.dedup();
+
+        Ok(format!(
+            "Deactivated module '{id}'. Restart zcast to apply, or re-enable anytime with 'zcast module activate {id}'."
+        ))
+    }
+
+    /// Re-activate a previously deactivated bundled module (or extra crate).
+    pub fn activate_module(&mut self, id: &str) -> Result<String, String> {
+        let id = id.trim();
+        if id.is_empty() {
+            return Err("module id cannot be empty".to_owned());
+        }
+        let is_extra = self.extra_crates.iter().any(|spec| spec.name == id);
+        if !is_bundled_module(id) && !is_extra {
+            return Err(format!(
+                "module '{id}' is not installed (install it first with 'zcast module install <id>')"
+            ));
+        }
+        if id == "zcast-cmd-k" && self.active_search_module().is_none() {
+            return Err(
+                "cannot activate 'zcast-cmd-k': requires 'zcast:search/provider@^1.0' (activate 'zcast-search-fts' or 'zcast-search-onnx' first)"
+                    .to_owned(),
+            );
+        }
+
+        let was_disabled = self.is_disabled(id);
+        if was_disabled {
+            self.disabled.retain(|disabled| disabled.trim() != id);
+        }
+
+        // Smart slot binding: activating a provider fills its interface slot.
+        match id {
+            "zcast-search-fts" | "zcast-search-onnx" => {
+                self.bindings
+                    .insert(zcast_interfaces::IFACE_SEARCH.to_owned(), id.to_owned());
+            }
+            "zcast-auth-basic" | "zcast-auth-magic-link" => {
+                self.bindings
+                    .insert(zcast_interfaces::IFACE_AUTH.to_owned(), id.to_owned());
+            }
+            _ => {}
+        }
+
+        if was_disabled {
+            Ok(format!("Activated module '{id}'. Restart zcast to apply."))
+        } else {
+            Ok(format!("Module '{id}' is already active."))
+        }
+    }
+
     /// Load a lock file from disk.
     pub fn load(path: &Path) -> Result<Self, String> {
         let raw = fs::read_to_string(path)
@@ -346,6 +528,10 @@ pub fn generate_shim_crate(build_dir: &Path, cfg: &ModuleLockConfig) -> Result<(
     manifest.push_str("path = \"src/main.rs\"\n\n");
     manifest.push_str("[dependencies]\n");
     for name in CORE_CRATES {
+        if cfg.is_disabled(name) {
+            manifest.push_str(&format!("# {name} = deactivated via zcast-modules.toml\n"));
+            continue;
+        }
         manifest.push_str(&core_dependency(name, version));
         manifest.push('\n');
     }
@@ -689,6 +875,7 @@ mod tests {
         let cfg = ModuleLockConfig {
             core_version: "v0.4.0".to_owned(),
             bindings,
+            disabled: Vec::new(),
             extra_crates: vec![
                 ModuleCrateSpec {
                     name: "zcast-extra-git".to_owned(),
@@ -796,6 +983,7 @@ mod tests {
             core_version: "0.4.0".to_owned(),
             bindings: BTreeMap::new(),
             extra_crates: vec![],
+            disabled: Vec::new(),
         };
 
         let path = build_custom_binary(&dir, &cfg, Some(2), true).expect("dry run");
@@ -807,5 +995,242 @@ mod tests {
         assert!(build_custom_binary(&dir, &cfg, Some(0), true).is_err());
 
         cleanup(&dir);
+    }
+
+    fn base_lock() -> ModuleLockConfig {
+        ModuleLockConfig {
+            core_version: "0.4.0".to_owned(),
+            bindings: BTreeMap::new(),
+            extra_crates: vec![],
+            disabled: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn deactivating_optional_module_marks_it_disabled() {
+        let mut cfg = base_lock();
+        let msg = cfg.deactivate_module("zcast-popover").expect("deactivate");
+        assert!(msg.contains("zcast-popover"), "{msg}");
+        assert!(cfg.is_disabled("zcast-popover"));
+        assert_eq!(cfg.disabled, vec!["zcast-popover".to_owned()]);
+    }
+
+    #[test]
+    fn reactivating_optional_module_clears_disabled() {
+        let mut cfg = base_lock();
+        cfg.deactivate_module("zcast-popover").expect("deactivate");
+        let msg = cfg.activate_module("zcast-popover").expect("activate");
+        assert!(msg.contains("zcast-popover"), "{msg}");
+        assert!(!cfg.is_disabled("zcast-popover"));
+        assert!(cfg.disabled.is_empty());
+    }
+
+    #[test]
+    fn mandatory_modules_cannot_be_deactivated() {
+        for id in [
+            "zcast-storage-sqlite",
+            "zcast-storage-mysql",
+            "zcast-links-wikilink",
+            "zcast-theme-davidhewitson",
+        ] {
+            let mut cfg = base_lock();
+            let err = cfg.deactivate_module(id).expect_err("mandatory guard");
+            assert!(
+                err.contains("cannot deactivate mandatory module") && err.contains(id),
+                "unexpected error: {err}"
+            );
+            assert!(err.contains("zcast module bind"), "{err}");
+            assert!(!cfg.is_disabled(id));
+        }
+    }
+
+    #[test]
+    fn unknown_modules_are_rejected() {
+        let mut cfg = base_lock();
+        let err = cfg
+            .deactivate_module("zcast-nope")
+            .expect_err("unknown deactivate");
+        assert!(err.contains("unknown module 'zcast-nope'"), "{err}");
+
+        let err = cfg
+            .activate_module("zcast-nope")
+            .expect_err("unknown activate");
+        assert!(err.contains("is not installed"), "{err}");
+    }
+
+    #[test]
+    fn search_provider_cannot_be_deactivated_while_cmd_k_is_active() {
+        let mut cfg = base_lock();
+        let err = cfg
+            .deactivate_module("zcast-search-fts")
+            .expect_err("dependency guard");
+        assert!(err.contains("zcast:search/provider@^1.0"), "{err}");
+        assert!(err.contains("zcast-cmd-k"), "{err}");
+        assert!(!cfg.is_disabled("zcast-search-fts"));
+
+        // Deactivating the command bar first unblocks the search provider.
+        cfg.deactivate_module("zcast-cmd-k").expect("cmd-k");
+        cfg.deactivate_module("zcast-search-fts")
+            .expect("search-fts after cmd-k");
+        assert!(cfg.is_disabled("zcast-cmd-k"));
+        assert!(cfg.is_disabled("zcast-search-fts"));
+        assert_eq!(cfg.active_search_module(), None);
+
+        // With no active search provider the command bar cannot come back.
+        let err = cfg
+            .activate_module("zcast-cmd-k")
+            .expect_err("cmd-k needs search");
+        assert!(err.contains("cannot activate 'zcast-cmd-k'"), "{err}");
+        assert!(err.contains("zcast:search/provider@^1.0"), "{err}");
+    }
+
+    #[test]
+    fn activating_onnx_binds_search_and_unblocks_fts_deactivation() {
+        let mut cfg = base_lock();
+        assert_eq!(cfg.active_search_module(), Some("zcast-search-fts"));
+
+        cfg.activate_module("zcast-search-onnx")
+            .expect("activate onnx");
+        assert_eq!(
+            cfg.bindings
+                .get(zcast_interfaces::IFACE_SEARCH)
+                .map(String::as_str),
+            Some("zcast-search-onnx")
+        );
+        assert_eq!(cfg.active_search_module(), Some("zcast-search-onnx"));
+
+        // cmd-k still registers because onnx keeps the slot fulfilled.
+        cfg.deactivate_module("zcast-search-fts")
+            .expect("fts with onnx active");
+        assert!(cfg.is_disabled("zcast-search-fts"));
+        assert_eq!(cfg.active_search_module(), Some("zcast-search-onnx"));
+    }
+
+    #[test]
+    fn active_search_module_respects_bindings_and_disabled() {
+        let mut cfg = base_lock();
+        assert_eq!(cfg.active_search_module(), Some("zcast-search-fts"));
+
+        cfg.bindings
+            .insert(zcast_interfaces::IFACE_SEARCH.to_owned(), "none".to_owned());
+        assert_eq!(cfg.active_search_module(), None);
+
+        cfg.bindings.insert(
+            zcast_interfaces::IFACE_SEARCH.to_owned(),
+            "zcast-search-fts".to_owned(),
+        );
+        cfg.deactivate_module("zcast-cmd-k").expect("cmd-k");
+        cfg.deactivate_module("zcast-search-fts").expect("fts");
+        assert_eq!(cfg.active_search_module(), None);
+
+        cfg.activate_module("zcast-search-onnx").expect("onnx");
+        assert_eq!(cfg.active_search_module(), Some("zcast-search-onnx"));
+    }
+
+    #[test]
+    fn switching_auth_provider_binds_auth_slot() {
+        let mut cfg = base_lock();
+        cfg.deactivate_module("zcast-auth-basic")
+            .expect("basic off");
+        assert!(cfg.is_disabled("zcast-auth-basic"));
+
+        cfg.activate_module("zcast-auth-magic-link")
+            .expect("magic-link on");
+        assert!(!cfg.is_disabled("zcast-auth-magic-link"));
+        assert_eq!(
+            cfg.bindings
+                .get(zcast_interfaces::IFACE_AUTH)
+                .map(String::as_str),
+            Some("zcast-auth-magic-link")
+        );
+    }
+
+    #[test]
+    fn deactivated_modules_are_tracked_once_and_sorted() {
+        let mut cfg = base_lock();
+        cfg.deactivate_module("zcast-popover").expect("popover");
+        cfg.deactivate_module("zcast-io-markdown").expect("io");
+        let again = cfg.deactivate_module("zcast-popover").expect("repeat");
+        assert!(again.contains("already deactivated"), "{again}");
+        assert_eq!(
+            cfg.disabled,
+            vec!["zcast-io-markdown".to_owned(), "zcast-popover".to_owned()]
+        );
+    }
+
+    #[test]
+    fn extra_crates_can_be_deactivated_and_reactivated() {
+        let mut cfg = base_lock();
+        cfg.extra_crates.push(ModuleCrateSpec {
+            name: "zcast-extra-widget".to_owned(),
+            version: Some("0.1.0".to_owned()),
+            git: None,
+            path: None,
+        });
+
+        cfg.deactivate_module("zcast-extra-widget")
+            .expect("deactivate extra");
+        assert!(cfg.is_disabled("zcast-extra-widget"));
+
+        cfg.activate_module("zcast-extra-widget")
+            .expect("reactivate extra");
+        assert!(!cfg.is_disabled("zcast-extra-widget"));
+    }
+
+    #[test]
+    fn shim_crate_omits_disabled_bundled_modules() {
+        let dir = temp_dir("shim-disabled");
+        let mut cfg = base_lock();
+        cfg.deactivate_module("zcast-popover").expect("popover");
+        cfg.deactivate_module("zcast-cmd-k").expect("cmd-k");
+
+        generate_shim_crate(&dir, &cfg).expect("generate shim");
+
+        let manifest = fs::read_to_string(dir.join("Cargo.toml")).expect("read manifest");
+        assert!(manifest.contains("zcast-storage-sqlite = { git ="));
+        assert!(!manifest.contains("zcast-popover = { git ="));
+        assert!(!manifest.contains("zcast-cmd-k = { git ="));
+        assert!(manifest.contains("# zcast-popover = deactivated"));
+        toml::from_str::<toml::Value>(&manifest).expect("manifest parses as TOML");
+
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn lock_config_roundtrips_disabled_modules() {
+        let dir = temp_dir("roundtrip");
+        let path = dir.join(MODULE_LOCK_FILE);
+
+        let mut cfg = base_lock();
+        // Nothing disabled: the key is omitted entirely.
+        cfg.save(&path).expect("save");
+        let raw = fs::read_to_string(&path).expect("read");
+        assert!(!raw.contains("disabled"), "{raw}");
+        let loaded = ModuleLockConfig::load(&path).expect("load");
+        assert!(loaded.disabled.is_empty());
+
+        cfg.deactivate_module("zcast-popover").expect("popover");
+        cfg.deactivate_module("zcast-cmd-k").expect("cmd-k");
+        cfg.save(&path).expect("save disabled");
+
+        let loaded = ModuleLockConfig::load(&path).expect("load disabled");
+        assert_eq!(loaded.disabled, cfg.disabled);
+        assert!(loaded.is_disabled("zcast-popover"));
+        assert!(loaded.is_disabled("zcast-cmd-k"));
+        assert!(!loaded.is_disabled("zcast-search-fts"));
+
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn classifies_bundled_modules() {
+        assert!(is_mandatory_module("zcast-storage-sqlite"));
+        assert!(is_mandatory_module("zcast-storage-mysql"));
+        assert!(!is_mandatory_module("zcast-popover"));
+        assert!(is_optional_bundled_module("zcast-popover"));
+        assert!(!is_optional_bundled_module("zcast-storage-sqlite"));
+        assert!(is_bundled_module("zcast-storage-sqlite"));
+        assert!(is_bundled_module("zcast-search-fts"));
+        assert!(!is_bundled_module("zcast-extra-widget"));
     }
 }
