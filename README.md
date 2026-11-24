@@ -1,20 +1,22 @@
-# `zcast`
+<p align="center">
+  <img src="assets/logo-banner.svg" alt="zcast — Fast, modular Rust Zettelkasten CMS" width="880" />
+</p>
 
 A fast, self-hosted, single-author Zettelkasten CMS built on a **contract-oriented Rust microkernel**.
 
 Every major capability—storage, `[[wikilink]]` graph, theme/reader, inline editor, hover popovers, full-text search, `⌘K` spotlight bar, and authentication—lives behind versioned Rust traits in [`zcast-interfaces`](https://github.com/zcast-cms/zcast-interfaces).
 
-## Highlights (`v0.4.0`)
+## Highlights (`v0.4.1`)
 
-- **One-line installer & Express setup:** `curl -sSL https://raw.githubusercontent.com/zcast-cms/zcast/main/installer/install.sh | sh` installs a prebuilt static binary, verifies SHA-256, and runs `zcast setup` (with automatic Caddy / Nginx / Apache detection & `systemd` unit generation).
+- **One-line installer & Express setup:** `curl -sSL https://raw.githubusercontent.com/zcast-cms/zcast/main/installer/install.sh | sh` installs a prebuilt static binary, verifies SHA-256, and runs `zcast setup` (with automatic Linux `systemd` + Caddy / Nginx / Apache + Certbot provisioning when run as root).
 - **Sliding-pane reader:** Click any `[[wikilink]]` to open the linked card to the right, trace your trail via breadcrumbs, close non-root panes, and share exact stacks via `/<root>?stack=a,b,c`.
 - **In-place TipTap editor:** Edit titles and Markdown bodies directly on any card with a floating formatting toolbar, `[[` live autocomplete, `Cmd/Ctrl+Click` + `Open ↗` link navigation while editing, debounced autosave + `Cmd+S`, and instant cross-pane backlink & rename updates.
 - **Hover preview popovers (`zcast-popover`):** Subtle hover cards on `[[wikilinks]]` with 150ms hover-intent delay, client caching, and automatic touch-device suppression.
 - **Swappable instant `⌘K` search (`zcast-search-fts` & `zcast-search-onnx` + `zcast-cmd-k`):** Choose pure-Rust full-text + graph-boosted search (`--search fts`) or local dense-vector semantic hybrid search (`--search onnx`).
-- **Swappable auth (`zcast-auth-basic` & `zcast-auth-magic-link`):** Argon2id password login OR scanner-safe `GET` → `POST` one-time magic links with `zcast auth login-link` SSH recovery—both backed by DB-agnostic `ModuleStore`.
+- **Swappable auth (`zcast-auth-basic` & `zcast-auth-magic-link`):** Argon2id password login (with `zcast auth set-password`) OR scanner-safe `GET` → `POST` one-time magic links (with `zcast auth login-link` SSH recovery)—both backed by DB-agnostic `ModuleStore`.
 - **SQLite & MySQL storage (`zcast-storage-sqlite` & `zcast-storage-mysql`):** Pure-Rust backends (`rustls` for MySQL) supporting WAL mode, atomic renames, and `ModuleStore`.
 - **Markdown export & import (`zcast-io-markdown`):** Full directory and `.zip` export/import preserving YAML frontmatter and `[[wikilinks]]` (via CLI `zcast export`/`import` or Admin UI).
-- **Admin dashboard & `xcaddy`-style module CLI:** Inspect the live Module Dependency Graph & edit site settings live at `/_zcast/admin`, manage modules via `zcast module list | graph | bind | install | update | remove`, and upgrade safely via `zcast update` (automatic `VACUUM INTO` SQLite snapshot + SHA-256 verification + auto-rollback).
+- **Admin dashboard & `xcaddy`-style module CLI:** Inspect the live Module Dependency Graph & edit site settings live at `/_zcast/admin`, manage modules via `zcast module list | graph | bind | activate | deactivate | install | update | remove`, and upgrade safely via `zcast update` (automatic `VACUUM INTO` SQLite snapshot + SHA-256 verification + `systemd` restart & health-check rollback).
 
 ## Quick Start
 
