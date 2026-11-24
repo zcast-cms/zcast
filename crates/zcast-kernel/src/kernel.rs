@@ -3,13 +3,67 @@ use crate::config::KernelConfig;
 use crate::error::KernelError;
 use crate::registry::{ModuleRegistry, RegistrySnapshot};
 use chrono::Utc;
-use std::sync::Arc;
+use serde::{Deserialize, Serialize};
+use std::sync::{Arc, RwLock};
 use zcast_interfaces::{
     AuthProvider, CardRenderContext, CardView, EditorProvider, HtmlRenderHook, IFACE_AUTH,
-    IFACE_EDITOR, IFACE_LINKS, IFACE_SEARCH, IFACE_STORAGE, IFACE_THEME, LinkParser, Note,
-    NoteAlias, NoteEvent, NoteId, NoteListFilter, NoteLifecycleHook, ReadContext, SearchProvider,
-    Storage, StorageError, ThemeProvider, UiExtension, UiSlots, slugify,
+    IFACE_EDITOR, IFACE_IO, IFACE_LINKS, IFACE_SEARCH, IFACE_STORAGE, IFACE_THEME, LinkParser,
+    Note, NoteAlias, NoteEvent, NoteExporter, NoteId, NoteImporter, NoteLifecycleHook,
+    NoteListFilter, ReadContext, SearchProvider, Storage, StorageError, ThemeColorMode,
+    ThemeProvider, UiExtension, UiSlots, slugify,
 };
+
+/// Namespace + key used to persist the live site settings in the `ModuleStore` (DEC-15).
+const APP_SETTINGS_NAMESPACE: &str = "zcast-kernel";
+const APP_SETTINGS_KEY: &str = "app:settings";
+
+/// Content/app settings edited live from the Admin UI (DEC-15).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AppSettings {
+    pub site_title: String,
+    pub pinned_home_slug: String,
+    pub color_mode: ThemeColorMode,
+}
+
+/// Partial on-disk representation so older or hand-edited values can merge over
+/// `KernelConfig` boot defaults field by field.
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct StoredAppSettings {
+    site_title: Option<String>,
+    pinned_home_slug: Option<String>,
+    color_mode: Option<ThemeColorMode>,
+}
+
+impl AppSettings {
+    fn from_config(config: &KernelConfig) -> Self {
+        Self {
+            site_title: config.site_title.clone(),
+            pinned_home_slug: config.pinned_home_slug.clone(),
+            color_mode: config.color_mode,
+        }
+    }
+
+    fn merge_stored(defaults: Self, stored: StoredAppSettings) -> Self {
+        let site_title = stored
+            .site_title
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or(defaults.site_title);
+        let pinned_home_slug = stored
+            .pinned_home_slug
+            .filter(|value| {
+                let slug = value.trim();
+                !slug.is_empty() && slug != "_zcast"
+            })
+            .unwrap_or(defaults.pinned_home_slug);
+
+        Self {
+            site_title,
+            pinned_home_slug,
+            color_mode: stored.color_mode.unwrap_or(defaults.color_mode),
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct SaveNoteResult {
@@ -27,9 +81,12 @@ pub struct ZcastKernel {
     pub editor: Option<Arc<dyn EditorProvider>>,
     pub auth: Option<Arc<dyn AuthProvider>>,
     pub search: Option<Arc<dyn SearchProvider>>,
+    pub exporter: Option<Arc<dyn NoteExporter>>,
+    pub importer: Option<Arc<dyn NoteImporter>>,
     pub ui_extensions: Vec<Arc<dyn UiExtension>>,
     pub render_cache: RenderCache,
     pub registry: ModuleRegistry,
+    app_settings: RwLock<AppSettings>,
 }
 
 pub struct ZcastKernelBuilder {
@@ -40,6 +97,8 @@ pub struct ZcastKernelBuilder {
     editor: Option<Arc<dyn EditorProvider>>,
     auth: Option<Arc<dyn AuthProvider>>,
     search: Option<Arc<dyn SearchProvider>>,
+    exporter: Option<Arc<dyn NoteExporter>>,
+    importer: Option<Arc<dyn NoteImporter>>,
     ui_extensions: Vec<Arc<dyn UiExtension>>,
     registry: ModuleRegistry,
 }
@@ -72,6 +131,8 @@ impl ZcastKernelBuilder {
             editor: None,
             auth: None,
             search: None,
+            exporter: None,
+            importer: None,
             ui_extensions: Vec::new(),
             registry,
         }
@@ -98,6 +159,22 @@ impl ZcastKernelBuilder {
         self.registry.bind_slot(IFACE_SEARCH, &m);
         self.registry.register_module(m);
         self.search = Some(search);
+        self
+    }
+
+    pub fn with_exporter(mut self, exporter: Arc<dyn NoteExporter>) -> Self {
+        let m = exporter.manifest();
+        self.registry.bind_slot(IFACE_IO, &m);
+        self.registry.register_module(m);
+        self.exporter = Some(exporter);
+        self
+    }
+
+    pub fn with_importer(mut self, importer: Arc<dyn NoteImporter>) -> Self {
+        let m = importer.manifest();
+        self.registry.bind_slot(IFACE_IO, &m);
+        self.registry.register_module(m);
+        self.importer = Some(importer);
         self
     }
 
@@ -128,6 +205,20 @@ impl ZcastKernelBuilder {
 
         self.storage.initialize().await?;
 
+        let defaults = AppSettings::from_config(&self.config);
+        let app_settings = match self
+            .storage
+            .module_store(APP_SETTINGS_NAMESPACE)
+            .get(APP_SETTINGS_KEY)
+            .await?
+        {
+            Some(value) => match serde_json::from_value::<StoredAppSettings>(value) {
+                Ok(stored) => AppSettings::merge_stored(defaults, stored),
+                Err(_) => defaults,
+            },
+            None => defaults,
+        };
+
         let kernel = Arc::new(ZcastKernel {
             config: self.config,
             storage: self.storage,
@@ -136,9 +227,12 @@ impl ZcastKernelBuilder {
             editor: self.editor,
             auth: self.auth,
             search: self.search,
+            exporter: self.exporter,
+            importer: self.importer,
             ui_extensions: self.ui_extensions,
             render_cache: RenderCache::new(),
             registry: self.registry,
+            app_settings: RwLock::new(app_settings),
         });
 
         kernel.seed_starter_content().await?;
@@ -158,6 +252,58 @@ impl ZcastKernelBuilder {
 impl ZcastKernel {
     pub fn registry_snapshot(&self) -> RegistrySnapshot {
         self.registry.snapshot()
+    }
+
+    /// Snapshot of the live content/app settings (DEC-15).
+    pub fn app_settings(&self) -> AppSettings {
+        self.app_settings
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    /// Validate, persist, and activate new live site settings.
+    /// Takes effect immediately: the render cache is invalidated so every page
+    /// picks up the new title, pinned home slug, and colour mode.
+    pub async fn update_app_settings(&self, next: AppSettings) -> Result<AppSettings, KernelError> {
+        let site_title = next.site_title.trim();
+        if site_title.is_empty() {
+            return Err(KernelError::BadRequest("site title cannot be empty".into()));
+        }
+
+        let pinned_home_slug = next.pinned_home_slug.trim();
+        if pinned_home_slug.is_empty() {
+            return Err(KernelError::BadRequest(
+                "pinned home slug cannot be empty".into(),
+            ));
+        }
+        if pinned_home_slug == "_zcast" {
+            return Err(KernelError::BadRequest("slug '_zcast' is reserved".into()));
+        }
+
+        let next = AppSettings {
+            site_title: site_title.to_owned(),
+            pinned_home_slug: pinned_home_slug.to_owned(),
+            color_mode: next.color_mode,
+        };
+        let value =
+            serde_json::to_value(&next).map_err(|error| KernelError::Config(error.to_string()))?;
+
+        self.storage
+            .module_store(APP_SETTINGS_NAMESPACE)
+            .put(APP_SETTINGS_KEY, &value, None)
+            .await?;
+
+        {
+            let mut guard = self
+                .app_settings
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            *guard = next.clone();
+        }
+        self.render_cache.invalidate_all();
+
+        Ok(next)
     }
 
     pub fn has_auth(&self) -> bool {
@@ -194,7 +340,7 @@ impl ZcastKernel {
              Try clicking **Edit** in the card toolbar to edit this note in place, select text for the floating formatting toolbar, or click [[My First Note]] to spin up a brand new card from an unresolved link.",
             false,
         );
-        index.slug = self.config.pinned_home_slug.clone();
+        index.slug = self.app_settings().pinned_home_slug;
 
         let panes = Note::new(
             "How Sliding Panes Work",
@@ -213,7 +359,9 @@ impl ZcastKernel {
 
         for note in [&index, &panes, &secret] {
             self.storage.save_note(note).await?;
-            self.links.sync_note_links(note, self.storage.as_ref()).await?;
+            self.links
+                .sync_note_links(note, self.storage.as_ref())
+                .await?;
         }
         self.render_cache.invalidate_all();
         Ok(())
@@ -231,8 +379,12 @@ impl ZcastKernel {
                 .links
                 .render_markdown_with_links(&note.markdown_body, self.storage.as_ref(), ctx)
                 .await?;
-            let hooked = self.registry.run_html_hooks(note, raw_html, ctx).into_string();
-            self.render_cache.insert(note.id.clone(), ctx, hooked.clone());
+            let hooked = self
+                .registry
+                .run_html_hooks(note, raw_html, ctx)
+                .into_string();
+            self.render_cache
+                .insert(note.id.clone(), ctx, hooked.clone());
             hooked
         };
 
@@ -302,6 +454,9 @@ impl ZcastKernel {
             slots.header_actions.push_str(
                 r#"<button type="button" class="zcast-header-btn" data-zcast-new-note>+ New Note</button>"#,
             );
+            slots.header_actions.push_str(
+                r#"<a href="/_zcast/admin" class="zcast-header-btn" data-zcast-admin-link>Admin</a>"#,
+            );
         }
         if let Some(auth) = &self.auth {
             slots
@@ -336,7 +491,9 @@ impl ZcastKernel {
         if let Some(search) = &self.search {
             search.index_note(&note).await?;
         }
-        self.registry.emit_event(&NoteEvent::Saved(note.clone())).await;
+        self.registry
+            .emit_event(&NoteEvent::Saved(note.clone()))
+            .await;
 
         let card = self.build_card_view(&note, ReadContext::ADMIN).await?;
         let card_html = self.render_card_html(&card, true);

@@ -20,6 +20,18 @@ pub struct KernelConfig {
     pub admin_user: String,
     /// Optional admin password for `basic` auth (set via `ZCAST_ADMIN_PASSWORD` or CLI).
     pub admin_password: Option<String>,
+    /// Admin email address for magic-link auth (env: `ZCAST_ADMIN_EMAIL`).
+    #[serde(default)]
+    pub admin_email: Option<String>,
+    /// Preferred search provider id such as `"fts"` or `"onnx"` (env: `ZCAST_SEARCH`).
+    #[serde(default)]
+    pub search: Option<String>,
+    /// Canonical public base URL used to mint absolute links (env: `ZCAST_PUBLIC_URL`).
+    #[serde(default)]
+    pub public_url: Option<String>,
+    /// Optional data directory for module-owned files such as search indexes (env: `ZCAST_DATA_DIR`).
+    #[serde(default)]
+    pub data_dir: Option<PathBuf>,
 }
 
 impl Default for KernelConfig {
@@ -35,6 +47,10 @@ impl Default for KernelConfig {
             auth: None,
             admin_user: "admin".to_owned(),
             admin_password: None,
+            admin_email: None,
+            search: None,
+            public_url: None,
+            data_dir: None,
         }
     }
 }
@@ -101,16 +117,35 @@ impl KernelConfig {
         {
             cfg.admin_password = Some(v);
         }
+        if let Ok(v) = std::env::var("ZCAST_ADMIN_EMAIL")
+            && !v.trim().is_empty()
+        {
+            cfg.admin_email = Some(v.trim().to_owned());
+        }
+        if let Ok(v) = std::env::var("ZCAST_SEARCH")
+            && !v.trim().is_empty()
+        {
+            cfg.search = Some(v.trim().to_ascii_lowercase());
+        }
+        if let Ok(v) = std::env::var("ZCAST_PUBLIC_URL")
+            && !v.trim().is_empty()
+        {
+            cfg.public_url = Some(v.trim().trim_end_matches('/').to_owned());
+        }
+        if let Ok(v) = std::env::var("ZCAST_DATA_DIR")
+            && !v.trim().is_empty()
+        {
+            cfg.data_dir = Some(PathBuf::from(v));
+        }
 
         Ok(cfg)
     }
 
     /// Enforce DEC-10 safety guard: refuse binding to non-loopback interfaces when no `auth` module is bound.
     pub fn validate_bind_safety(&self, has_auth_module: bool) -> Result<SocketAddr, KernelError> {
-        let addr: SocketAddr = self
-            .bind_addr
-            .parse()
-            .map_err(|e| KernelError::Config(format!("invalid bind_addr '{}': {e}", self.bind_addr)))?;
+        let addr: SocketAddr = self.bind_addr.parse().map_err(|e| {
+            KernelError::Config(format!("invalid bind_addr '{}': {e}", self.bind_addr))
+        })?;
 
         if !has_auth_module && !addr.ip().is_loopback() && !self.allow_unauthenticated_public {
             return Err(KernelError::UnsafeUnauthenticatedBind(

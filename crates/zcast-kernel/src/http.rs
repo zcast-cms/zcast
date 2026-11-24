@@ -1,5 +1,5 @@
 use crate::error::KernelError;
-use crate::kernel::ZcastKernel;
+use crate::kernel::{AppSettings, ZcastKernel};
 use axum::extract::{Form, Path, Query, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{Html as AxumHtml, IntoResponse, Redirect, Response};
@@ -10,8 +10,13 @@ use std::sync::Arc;
 use tower_http::trace::TraceLayer;
 use zcast_interfaces::{
     Asset, BreadcrumbItem, CardView, NoteId, NoteListFilter, NoteSort, PageContext, ReadContext,
-    SearchCapabilities, SearchHit, SearchQuery, StorageError,
+    SearchCapabilities, SearchHit, SearchQuery, StorageError, ThemeColorMode,
 };
+
+/// Neutral confirmation shown for every magic-link request so the endpoint
+/// never leaks whether an address is the configured administrator.
+const MAGIC_LINK_NOTICE: &str = "If that email matches the site administrator, a one-time \
+sign-in link has been sent (check your inbox or server logs).";
 
 pub fn router(kernel: Arc<ZcastKernel>) -> Router {
     Router::new()
@@ -22,14 +27,26 @@ pub fn router(kernel: Arc<ZcastKernel>) -> Router {
         .route("/_zcast/ext/{prefix}/{*path}", get(extension_asset))
         .route("/_zcast/custom.css", get(custom_css))
         .route("/_zcast/login", get(login_page).post(login_submit))
+        .route(
+            "/_zcast/auth/magic",
+            get(magic_confirm_page).post(magic_confirm_submit),
+        )
         .route("/_zcast/logout", post(logout_submit))
+        .route("/_zcast/admin", get(admin_page))
+        .route("/_zcast/admin/settings", post(admin_update_settings))
+        .route("/_zcast/api/export.zip", get(export_zip_api))
         .route("/_zcast/popover/{slug}", get(get_popover))
         .route("/_zcast/search", get(search_notes))
         .route("/_zcast/cards/{slug}", get(get_card_fragment))
-        .route("/_zcast/api/notes", get(list_notes_api).post(create_note_api))
+        .route(
+            "/_zcast/api/notes",
+            get(list_notes_api).post(create_note_api),
+        )
         .route(
             "/_zcast/api/notes/{id}",
-            get(get_note_api).put(update_note_api).delete(delete_note_api),
+            get(get_note_api)
+                .put(update_note_api)
+                .delete(delete_note_api),
         )
         .route("/", get(home_page))
         .route("/{slug}", get(note_page))
@@ -48,12 +65,50 @@ struct LoginQuery {
     next: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 struct LoginForm {
+    #[serde(default)]
     username: String,
+    #[serde(default)]
     password: String,
     #[serde(default)]
+    email: String,
+    #[serde(default)]
     next: String,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct MagicQuery {
+    #[serde(default)]
+    token: String,
+    #[serde(default)]
+    next: String,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct MagicForm {
+    #[serde(default)]
+    token: String,
+    #[serde(default)]
+    next: String,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct AdminQuery {
+    #[serde(default)]
+    saved: Option<String>,
+    #[serde(default)]
+    error: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct AdminSettingsForm {
+    #[serde(default)]
+    site_title: String,
+    #[serde(default)]
+    pinned_home_slug: String,
+    #[serde(default)]
+    color_mode: String,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -185,10 +240,7 @@ fn asset_response(asset: Option<Asset>) -> Response {
     }
 }
 
-async fn theme_asset(
-    State(kernel): State<Arc<ZcastKernel>>,
-    Path(path): Path<String>,
-) -> Response {
+async fn theme_asset(State(kernel): State<Arc<ZcastKernel>>, Path(path): Path<String>) -> Response {
     asset_response(kernel.theme.get_asset(&path))
 }
 
@@ -244,12 +296,8 @@ async fn login_page(
     if resolve_is_admin(&kernel, &headers, None).await {
         return Redirect::to(next).into_response();
     }
-    let html = auth.render_login_page(
-        &kernel.config.site_title,
-        kernel.config.color_mode,
-        None,
-        next,
-    );
+    let settings = kernel.app_settings();
+    let html = auth.render_login_page(&settings.site_title, settings.color_mode, None, next);
     (
         [(header::CACHE_CONTROL, HeaderValue::from_static("no-store"))],
         AxumHtml(html.into_string()),
@@ -267,20 +315,31 @@ async fn login_submit(
     };
     let next = sanitize_redirect_path(&form.next);
 
+    if auth.supports_magic_link() {
+        // Always answer with the same neutral notice: whether the address
+        // matched the administrator must never be observable.
+        let base_url = request_base_url(&kernel, &headers);
+        if let Err(error) = auth.request_magic_link(&form.email, &base_url).await {
+            tracing::warn!(%error, "could not mint a magic login link");
+        }
+        let settings = kernel.app_settings();
+        let html = auth.render_login_page(
+            &settings.site_title,
+            settings.color_mode,
+            Some(MAGIC_LINK_NOTICE),
+            next,
+        );
+        return (
+            StatusCode::OK,
+            [(header::CACHE_CONTROL, HeaderValue::from_static("no-store"))],
+            AxumHtml(html.into_string()),
+        )
+            .into_response();
+    }
+
     match auth.authenticate(&form.username, &form.password).await {
         Ok(Some(token)) => {
-            let secure = if request_is_https(&headers) {
-                "; Secure"
-            } else {
-                ""
-            };
-            let cookie = format!(
-                "{}={}; HttpOnly; SameSite=Lax; Path=/; Max-Age={}{}",
-                auth.session_cookie_name(),
-                token,
-                auth.session_ttl_seconds(),
-                secure
-            );
+            let cookie = session_cookie(auth.as_ref(), &token, &headers);
             let mut resp = Redirect::to(next).into_response();
             if let Ok(val) = HeaderValue::from_str(&cookie) {
                 resp.headers_mut().insert(header::SET_COOKIE, val);
@@ -288,9 +347,10 @@ async fn login_submit(
             resp
         }
         Ok(None) => {
+            let settings = kernel.app_settings();
             let html = auth.render_login_page(
-                &kernel.config.site_title,
-                kernel.config.color_mode,
+                &settings.site_title,
+                settings.color_mode,
                 Some("Invalid username or password."),
                 next,
             );
@@ -302,9 +362,10 @@ async fn login_submit(
                 .into_response()
         }
         Err(e) => {
+            let settings = kernel.app_settings();
             let html = auth.render_login_page(
-                &kernel.config.site_title,
-                kernel.config.color_mode,
+                &settings.site_title,
+                settings.color_mode,
                 Some(&format!("Sign-in failed: {e}")),
                 next,
             );
@@ -318,10 +379,236 @@ async fn login_submit(
     }
 }
 
-async fn logout_submit(
+/// Build the `Set-Cookie` value for a freshly minted session token.
+fn session_cookie(
+    auth: &dyn zcast_interfaces::AuthProvider,
+    token: &str,
+    headers: &HeaderMap,
+) -> String {
+    let secure = if request_is_https(headers) {
+        "; Secure"
+    } else {
+        ""
+    };
+    format!(
+        "{}={}; HttpOnly; SameSite=Lax; Path=/; Max-Age={}{}",
+        auth.session_cookie_name(),
+        token,
+        auth.session_ttl_seconds(),
+        secure
+    )
+}
+
+/// Resolve the canonical base URL for absolute links.
+fn request_base_url(kernel: &ZcastKernel, headers: &HeaderMap) -> String {
+    if let Some(configured) = &kernel.config.public_url {
+        let trimmed = configured.trim().trim_end_matches('/');
+        if !trimmed.is_empty() {
+            return trimmed.to_owned();
+        }
+    }
+
+    let scheme = if request_is_https(headers) {
+        "https"
+    } else {
+        "http"
+    };
+    let host = headers
+        .get(header::HOST)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("localhost");
+    format!("{scheme}://{host}")
+}
+
+/// `GET /_zcast/auth/magic` — scanner-safe confirmation page.
+/// Deliberately only *peeks* at the token so email security scanners that
+/// pre-fetch `GET` URLs can never burn a real recipient's one-time link.
+async fn magic_confirm_page(
+    State(kernel): State<Arc<ZcastKernel>>,
+    Query(query): Query<MagicQuery>,
+) -> Response {
+    let Some(auth) = &kernel.auth else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    if !auth.supports_magic_link() {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+
+    let next = sanitize_redirect_path(&query.next);
+    let valid = auth.peek_magic_token(&query.token).await.unwrap_or(false);
+    let settings = kernel.app_settings();
+    let html = auth.render_magic_confirm_page(
+        &settings.site_title,
+        settings.color_mode,
+        &query.token,
+        valid,
+        next,
+    );
+    (
+        [(header::CACHE_CONTROL, HeaderValue::from_static("no-store"))],
+        AxumHtml(html.into_string()),
+    )
+        .into_response()
+}
+
+/// `POST /_zcast/auth/magic` — consume the one-time token and start a session.
+async fn magic_confirm_submit(
     State(kernel): State<Arc<ZcastKernel>>,
     headers: HeaderMap,
+    Form(form): Form<MagicForm>,
 ) -> Response {
+    let Some(auth) = &kernel.auth else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    if !auth.supports_magic_link() {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+
+    let next = sanitize_redirect_path(&form.next);
+    match auth.consume_magic_token(&form.token).await {
+        Ok(Some(token)) => {
+            let cookie = session_cookie(auth.as_ref(), &token, &headers);
+            let mut resp = Redirect::to(next).into_response();
+            if let Ok(val) = HeaderValue::from_str(&cookie) {
+                resp.headers_mut().insert(header::SET_COOKIE, val);
+            }
+            resp
+        }
+        Ok(None) => expired_magic_link(&kernel, auth.as_ref(), &form.token, next),
+        Err(error) => {
+            tracing::warn!(%error, "magic login link could not be consumed");
+            expired_magic_link(&kernel, auth.as_ref(), &form.token, next)
+        }
+    }
+}
+
+fn expired_magic_link(
+    kernel: &ZcastKernel,
+    auth: &dyn zcast_interfaces::AuthProvider,
+    token: &str,
+    next: &str,
+) -> Response {
+    let settings = kernel.app_settings();
+    let html = auth.render_magic_confirm_page(
+        &settings.site_title,
+        settings.color_mode,
+        token,
+        false,
+        next,
+    );
+    (
+        StatusCode::UNAUTHORIZED,
+        [(header::CACHE_CONTROL, HeaderValue::from_static("no-store"))],
+        AxumHtml(html.into_string()),
+    )
+        .into_response()
+}
+
+/// `GET /_zcast/admin` — live settings + module dependency graph dashboard.
+async fn admin_page(
+    State(kernel): State<Arc<ZcastKernel>>,
+    headers: HeaderMap,
+    Query(query): Query<AdminQuery>,
+) -> Response {
+    if !resolve_is_admin(&kernel, &headers, None).await {
+        return admin_denied(&kernel);
+    }
+
+    let notice = match query.saved.as_deref() {
+        Some("1") => Some("Settings saved."),
+        _ => None,
+    };
+    let error = query.error.as_deref();
+    let html = crate::admin::render_admin_page(&kernel, notice, error);
+    (
+        [(header::CACHE_CONTROL, HeaderValue::from_static("no-store"))],
+        AxumHtml(html),
+    )
+        .into_response()
+}
+
+/// Admin pages redirect to the login form when auth is active, else forbid.
+fn admin_denied(kernel: &ZcastKernel) -> Response {
+    if kernel.has_auth() {
+        Redirect::to("/_zcast/login?next=/_zcast/admin").into_response()
+    } else {
+        StatusCode::FORBIDDEN.into_response()
+    }
+}
+
+/// `POST /_zcast/admin/settings` — persist live settings and redirect back.
+async fn admin_update_settings(
+    State(kernel): State<Arc<ZcastKernel>>,
+    headers: HeaderMap,
+    Form(form): Form<AdminSettingsForm>,
+) -> Response {
+    if !resolve_is_admin(&kernel, &headers, None).await {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+
+    let next = AppSettings {
+        site_title: form.site_title.trim().to_owned(),
+        pinned_home_slug: form.pinned_home_slug.trim().to_owned(),
+        color_mode: ThemeColorMode::parse(&form.color_mode),
+    };
+
+    match kernel.update_app_settings(next).await {
+        Ok(_) => Redirect::to("/_zcast/admin?saved=1").into_response(),
+        Err(error) => {
+            let html = crate::admin::render_admin_page(&kernel, None, Some(&error.to_string()));
+            (
+                StatusCode::BAD_REQUEST,
+                [(header::CACHE_CONTROL, HeaderValue::from_static("no-store"))],
+                AxumHtml(html),
+            )
+                .into_response()
+        }
+    }
+}
+
+/// `GET /_zcast/api/export.zip` — authenticated Markdown backup archive.
+async fn export_zip_api(State(kernel): State<Arc<ZcastKernel>>, headers: HeaderMap) -> Response {
+    if !resolve_is_admin(&kernel, &headers, None).await {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    let Some(exporter) = &kernel.exporter else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+
+    match exporter
+        .export_to_zip_bytes(kernel.storage.as_ref(), ReadContext::ADMIN)
+        .await
+    {
+        Ok((bytes, summary)) => {
+            tracing::info!(
+                exported = summary.exported,
+                skipped_private = summary.skipped_private,
+                "markdown backup exported"
+            );
+            let mut resp = Response::new(axum::body::Body::from(bytes));
+            *resp.status_mut() = StatusCode::OK;
+            let response_headers = resp.headers_mut();
+            response_headers.insert(
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("application/zip"),
+            );
+            response_headers.insert(
+                header::CONTENT_DISPOSITION,
+                HeaderValue::from_static("attachment; filename=\"zcast-notes.zip\""),
+            );
+            response_headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+            resp
+        }
+        Err(error) => {
+            tracing::error!(%error, "markdown backup export failed");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
+async fn logout_submit(State(kernel): State<Arc<ZcastKernel>>, headers: HeaderMap) -> Response {
     let Some(auth) = &kernel.auth else {
         return Redirect::to("/").into_response();
     };
@@ -479,8 +766,19 @@ fn build_popover_excerpt_html(rendered_html: &str, max_chars: usize) -> String {
                     out.push_str(raw);
                     let is_void = matches!(
                         name.as_str(),
-                        "br" | "hr" | "img" | "input" | "meta" | "link" | "area" | "base" | "col"
-                            | "embed" | "param" | "source" | "track" | "wbr"
+                        "br" | "hr"
+                            | "img"
+                            | "input"
+                            | "meta"
+                            | "link"
+                            | "area"
+                            | "base"
+                            | "col"
+                            | "embed"
+                            | "param"
+                            | "source"
+                            | "track"
+                            | "wbr"
                     );
                     if !self_closing && !is_void {
                         stack.push(name);
@@ -542,11 +840,7 @@ async fn custom_css(State(kernel): State<Arc<ZcastKernel>>) -> Response {
     if let Some(path) = &kernel.config.custom_css_path
         && let Ok(content) = tokio::fs::read(path).await
     {
-        return (
-            [(header::CONTENT_TYPE, "text/css; charset=utf-8")],
-            content,
-        )
-            .into_response();
+        return ([(header::CONTENT_TYPE, "text/css; charset=utf-8")], content).into_response();
     }
     StatusCode::NOT_FOUND.into_response()
 }
@@ -556,7 +850,7 @@ async fn home_page(
     headers: HeaderMap,
     Query(query): Query<PageQuery>,
 ) -> Response {
-    let slug = kernel.config.pinned_home_slug.clone();
+    let slug = kernel.app_settings().pinned_home_slug;
     render_note_stack(kernel, slug, headers, query, true).await
 }
 
@@ -580,6 +874,7 @@ async fn render_note_stack(
     let ctx = ReadContext {
         include_private: is_admin,
     };
+    let settings = kernel.app_settings();
 
     let lookup = match kernel
         .storage
@@ -592,8 +887,8 @@ async fn render_note_stack(
                 404,
                 "Note not found",
                 &format!("No note exists at '/{root_slug}'."),
-                &kernel.config.site_title,
-                kernel.config.color_mode,
+                &settings.site_title,
+                settings.color_mode,
             );
             return (StatusCode::NOT_FOUND, AxumHtml(html.into_string())).into_response();
         }
@@ -602,10 +897,13 @@ async fn render_note_stack(
                 500,
                 "Server error",
                 &e.to_string(),
-                &kernel.config.site_title,
-                kernel.config.color_mode,
+                &settings.site_title,
+                settings.color_mode,
             );
-            return (StatusCode::INTERNAL_SERVER_ERROR, AxumHtml(html.into_string()))
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                AxumHtml(html.into_string()),
+            )
                 .into_response();
         }
     };
@@ -640,16 +938,23 @@ async fn render_note_stack(
                 500,
                 "Render error",
                 &e.to_string(),
-                &kernel.config.site_title,
-                kernel.config.color_mode,
+                &settings.site_title,
+                settings.color_mode,
             );
-            return (StatusCode::INTERNAL_SERVER_ERROR, AxumHtml(html.into_string()))
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                AxumHtml(html.into_string()),
+            )
                 .into_response();
         }
     }
 
     if let Some(stack_raw) = &query.stack {
-        for raw_slug in stack_raw.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+        for raw_slug in stack_raw
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
             if let Ok(Some(extra)) = kernel
                 .storage
                 .get_note_by_slug_or_alias(raw_slug, ctx)
@@ -671,15 +976,13 @@ async fn render_note_stack(
     }
 
     let mut slots = kernel.page_ui_slots(is_admin);
-    if is_admin
-        && let (Some(editor), Some(first)) = (&kernel.editor, cards.first())
-    {
+    if is_admin && let (Some(editor), Some(first)) = (&kernel.editor, cards.first()) {
         slots.card_toolbar = editor.card_toolbar_slot(first).into_string();
     }
 
     let page_ctx = PageContext {
-        site_title: kernel.config.site_title.clone(),
-        color_mode: kernel.config.color_mode,
+        site_title: settings.site_title,
+        color_mode: settings.color_mode,
         is_admin,
         breadcrumbs,
         cards,
@@ -868,9 +1171,9 @@ impl IntoResponse for ApiError {
             KernelError::NotFound(_) => StatusCode::NOT_FOUND,
             KernelError::BadRequest(_) => StatusCode::BAD_REQUEST,
             KernelError::Forbidden => StatusCode::FORBIDDEN,
-            KernelError::Storage(StorageError::SlugConflict(_) | StorageError::TitleConflict(_)) => {
-                StatusCode::CONFLICT
-            }
+            KernelError::Storage(
+                StorageError::SlugConflict(_) | StorageError::TitleConflict(_),
+            ) => StatusCode::CONFLICT,
             KernelError::Storage(StorageError::NotFound(_)) => StatusCode::NOT_FOUND,
             _ => StatusCode::INTERNAL_SERVER_ERROR,
         };

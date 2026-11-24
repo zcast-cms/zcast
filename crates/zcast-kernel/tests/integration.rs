@@ -3,13 +3,19 @@ use axum::http::{Request, StatusCode, header};
 use std::sync::Arc;
 use tower::ServiceExt;
 use zcast_auth_basic::BasicAuthProvider;
+use zcast_auth_magic_link::MagicLinkAuthProvider;
 use zcast_cmd_k::CommandBar;
 use zcast_editor_inline::InlineEditor;
-use zcast_interfaces::{IFACE_SEARCH, Note, ReadContext, ThemeColorMode};
+use zcast_interfaces::{
+    AuthProvider, IFACE_SEARCH, Note, NoteImporter, NoteListFilter, ReadContext, Storage,
+    ThemeColorMode,
+};
+use zcast_io_markdown::MarkdownIo;
 use zcast_kernel::{KernelConfig, KernelError, ZcastKernelBuilder};
 use zcast_links_wikilink::WikilinkParser;
 use zcast_popover::HoverPopover;
 use zcast_search_fts::FtsSearchProvider;
+use zcast_search_onnx::OnnxSearchProvider;
 use zcast_storage_sqlite::SqliteStorage;
 use zcast_theme_davidhewitson::DavidHewitsonTheme;
 
@@ -114,7 +120,11 @@ async fn creating_target_note_invalidates_cache_and_resolves_link() {
         .build_card_view(&index, ReadContext::PUBLIC)
         .await
         .unwrap();
-    assert!(!before.rendered_html.contains(r#"data-zcast-note="my-first-note""#));
+    assert!(
+        !before
+            .rendered_html
+            .contains(r#"data-zcast-note="my-first-note""#)
+    );
 
     // Create "My First Note"
     kernel
@@ -131,7 +141,11 @@ async fn creating_target_note_invalidates_cache_and_resolves_link() {
         .build_card_view(&index, ReadContext::PUBLIC)
         .await
         .unwrap();
-    assert!(after.rendered_html.contains(r#"data-zcast-note="my-first-note""#));
+    assert!(
+        after
+            .rendered_html
+            .contains(r#"data-zcast-note="my-first-note""#)
+    );
 }
 
 #[tokio::test]
@@ -155,7 +169,10 @@ async fn renaming_note_rewrites_citing_markdown_and_redirects_old_slug() {
         )
         .await
         .unwrap();
-    assert_eq!(res.renamed_from_slug.as_deref(), Some("how-sliding-panes-work"));
+    assert_eq!(
+        res.renamed_from_slug.as_deref(),
+        Some("how-sliding-panes-work")
+    );
     assert_eq!(res.note.slug, "sliding-panes-guide");
 
     // Index's markdown should now contain [[Sliding Panes Guide]]
@@ -401,7 +418,9 @@ async fn failed_rename_leaves_link_edges_untouched() {
         "edges must still point at the old title: {edges:?}"
     );
     assert!(
-        edges.iter().all(|link| link["target_title"] != "Taken Title"),
+        edges
+            .iter()
+            .all(|link| link["target_title"] != "Taken Title"),
         "failed rename must not rewrite edges: {edges:?}"
     );
 
@@ -773,7 +792,10 @@ async fn deleting_citing_note_removes_it_from_backlinks_immediately() {
 
 async fn full_v02_kernel(
     with_auth: bool,
-) -> (Arc<zcast_kernel::ZcastKernel>, Option<Arc<BasicAuthProvider>>) {
+) -> (
+    Arc<zcast_kernel::ZcastKernel>,
+    Option<Arc<BasicAuthProvider>>,
+) {
     let storage = Arc::new(SqliteStorage::connect("sqlite::memory:").await.unwrap());
     let links = Arc::new(WikilinkParser::new());
     let theme = Arc::new(DavidHewitsonTheme::new());
@@ -1238,4 +1260,460 @@ async fn basic_auth_protects_admin_routes_and_handles_login_logout_flow() {
         .await
         .unwrap();
     assert_eq!(after_logout.status(), StatusCode::NOT_FOUND);
+}
+
+/* ========================================================================== */
+/* v0.3 + v0.4: Magic-link auth, live admin settings, module graph, backups    */
+/* ========================================================================== */
+
+async fn response_text(resp: axum::response::Response) -> String {
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    String::from_utf8(bytes.to_vec()).unwrap()
+}
+
+fn form_request(method: &str, uri: &str, body: String) -> Request<Body> {
+    Request::builder()
+        .method(method)
+        .uri(uri)
+        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .body(Body::from(body))
+        .unwrap()
+}
+
+async fn magic_link_kernel() -> (
+    Arc<zcast_kernel::ZcastKernel>,
+    Arc<MagicLinkAuthProvider>,
+    Arc<SqliteStorage>,
+) {
+    let storage = Arc::new(SqliteStorage::connect("sqlite::memory:").await.unwrap());
+    let links = Arc::new(WikilinkParser::new());
+    let theme = Arc::new(DavidHewitsonTheme::new());
+    let provider = Arc::new(MagicLinkAuthProvider::new(
+        storage.clone(),
+        "admin@example.com",
+    ));
+    let config = KernelConfig {
+        site_title: "David's Notes".into(),
+        color_mode: ThemeColorMode::Dark,
+        public_url: Some("https://notes.example.com".into()),
+        ..Default::default()
+    };
+
+    let kernel = ZcastKernelBuilder::new(config, storage.clone(), links, theme)
+        .with_auth(provider.clone())
+        .build()
+        .await
+        .unwrap();
+
+    (kernel, provider, storage)
+}
+
+#[tokio::test]
+async fn magic_link_login_is_scanner_safe_one_time_and_unlocks_admin() {
+    let (kernel, provider, storage) = magic_link_kernel().await;
+    let app = zcast_kernel::http::router(kernel);
+
+    // 1. Requesting a link always returns the same neutral notice, with no cookie.
+    let login = app
+        .clone()
+        .oneshot(form_request(
+            "POST",
+            "/_zcast/login",
+            "email=admin%40example.com&next=%2F_zcast%2Fadmin".to_owned(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(login.status(), StatusCode::OK);
+    assert_eq!(
+        login.headers().get(header::CACHE_CONTROL).unwrap(),
+        "no-store"
+    );
+    assert!(login.headers().get(header::SET_COOKIE).is_none());
+    let login_html = response_text(login).await;
+    assert!(
+        login_html.contains("one-time sign-in link"),
+        "neutral notice missing: {login_html}"
+    );
+
+    // The POST minted a hashed token in the provider's ModuleStore.
+    let minted = storage
+        .module_store("zcast-auth-magic-link")
+        .list_prefix("magic:", None)
+        .await
+        .unwrap();
+    assert_eq!(minted.len(), 1, "login POST must mint exactly one token");
+
+    // 2. Mint a known link through the same provider path so the token can be replayed.
+    let link = provider
+        .create_cli_login_link("https://notes.example.com")
+        .await
+        .unwrap();
+    let token = link
+        .split("token=")
+        .nth(1)
+        .expect("token in magic link")
+        .to_owned();
+
+    // 3. GET twice: peeking must never consume the token.
+    for _ in 0..2 {
+        let confirm = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/_zcast/auth/magic?token={token}&next=/_zcast/admin"
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(confirm.status(), StatusCode::OK);
+        assert_eq!(
+            confirm.headers().get(header::CACHE_CONTROL).unwrap(),
+            "no-store"
+        );
+        let confirm_html = response_text(confirm).await;
+        assert!(
+            confirm_html.contains("data-zcast-magic-confirm"),
+            "valid link must render the confirm form: {confirm_html}"
+        );
+    }
+    assert!(
+        provider.peek_magic_token(&token).await.unwrap(),
+        "GET requests must not consume the token"
+    );
+
+    // 4. POST consumes the token and starts an admin session.
+    let consume = app
+        .clone()
+        .oneshot(form_request(
+            "POST",
+            "/_zcast/auth/magic",
+            format!("token={token}&next=/_zcast/admin"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(consume.status(), StatusCode::SEE_OTHER);
+    assert_eq!(
+        consume.headers().get(header::LOCATION).unwrap(),
+        "/_zcast/admin"
+    );
+    let set_cookie = consume
+        .headers()
+        .get(header::SET_COOKIE)
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_owned();
+    assert!(set_cookie.starts_with("zcast_session="));
+    assert!(set_cookie.contains("HttpOnly"));
+    assert!(set_cookie.contains("SameSite=Lax"));
+    assert!(set_cookie.contains("Path=/"));
+    let cookie_pair = set_cookie.split(';').next().unwrap().to_owned();
+
+    // 5. The session cookie unlocks the admin dashboard.
+    let admin = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/_zcast/admin")
+                .header(header::COOKIE, &cookie_pair)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(admin.status(), StatusCode::OK);
+    assert!(response_text(admin).await.contains("data-zcast-admin-page"));
+
+    // 6. Replaying the same one-time token is rejected.
+    let replay = app
+        .oneshot(form_request(
+            "POST",
+            "/_zcast/auth/magic",
+            format!("token={token}&next=/_zcast/admin"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(replay.status(), StatusCode::UNAUTHORIZED);
+}
+
+async fn admin_io_kernel() -> (Arc<zcast_kernel::ZcastKernel>, Arc<SqliteStorage>) {
+    let storage = Arc::new(SqliteStorage::connect("sqlite::memory:").await.unwrap());
+    let links = Arc::new(WikilinkParser::new());
+    let theme = Arc::new(DavidHewitsonTheme::new());
+    let auth = Arc::new(BasicAuthProvider::new(storage.clone()));
+    let config = KernelConfig {
+        site_title: "David's Notes".into(),
+        color_mode: ThemeColorMode::Dark,
+        ..Default::default()
+    };
+
+    let kernel = ZcastKernelBuilder::new(config, storage.clone(), links, theme)
+        .with_auth(auth.clone())
+        .with_exporter(Arc::new(MarkdownIo::new()))
+        .with_importer(Arc::new(MarkdownIo::new()))
+        .build()
+        .await
+        .unwrap();
+
+    auth.ensure_admin_credentials("admin", Some("s3cr3t-pass"))
+        .await
+        .unwrap();
+
+    (kernel, storage)
+}
+
+async fn admin_cookie(app: &axum::Router) -> String {
+    let login = app
+        .clone()
+        .oneshot(form_request(
+            "POST",
+            "/_zcast/login",
+            "username=admin&password=s3cr3t-pass&next=/_zcast/admin".to_owned(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(login.status(), StatusCode::SEE_OTHER);
+    login
+        .headers()
+        .get(header::SET_COOKIE)
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_owned()
+}
+
+#[tokio::test]
+async fn admin_zip_export_is_gated_and_round_trips_through_markdown_io() {
+    let (kernel, _storage) = admin_io_kernel().await;
+    let app = zcast_kernel::http::router(kernel);
+
+    // Unauthenticated visitors cannot download a backup.
+    let unauthorized = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/_zcast/api/export.zip")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(unauthorized.status(), StatusCode::FORBIDDEN);
+
+    let cookie = admin_cookie(&app).await;
+    let export = app
+        .oneshot(
+            Request::builder()
+                .uri("/_zcast/api/export.zip")
+                .header(header::COOKIE, &cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(export.status(), StatusCode::OK);
+    assert_eq!(
+        export.headers().get(header::CONTENT_TYPE).unwrap(),
+        "application/zip"
+    );
+    assert_eq!(
+        export.headers().get(header::CACHE_CONTROL).unwrap(),
+        "no-store"
+    );
+    let disposition = export
+        .headers()
+        .get(header::CONTENT_DISPOSITION)
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_owned();
+    assert!(disposition.contains("zcast-notes.zip"), "{disposition}");
+
+    let bytes = axum::body::to_bytes(export.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(&bytes[..2], b"PK", "export must be a zip archive");
+
+    // The archive must round-trip through the Markdown importer.
+    let fresh = Arc::new(SqliteStorage::connect("sqlite::memory:").await.unwrap());
+    fresh.initialize().await.unwrap();
+    let summary = MarkdownIo::new()
+        .import_from_zip_bytes(fresh.as_ref(), &bytes)
+        .await
+        .unwrap();
+    assert!(summary.created >= 3, "expected seeded notes: {summary:?}");
+
+    let restored = fresh
+        .list_notes(NoteListFilter::default(), ReadContext::ADMIN)
+        .await
+        .unwrap();
+    assert!(restored.iter().any(|note| note.title == "Index"));
+    assert!(
+        restored.iter().any(|note| note.private),
+        "admin backup must include private notes"
+    );
+}
+
+#[tokio::test]
+async fn admin_dashboard_redirects_guests_and_applies_live_settings() {
+    let (kernel, _storage) = admin_io_kernel().await;
+    let app = zcast_kernel::http::router(kernel);
+
+    // 1. Guests are redirected to the login page (auth is active).
+    let guest = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/_zcast/admin")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(guest.status(), StatusCode::SEE_OTHER);
+    assert_eq!(
+        guest.headers().get(header::LOCATION).unwrap(),
+        "/_zcast/login?next=/_zcast/admin"
+    );
+
+    let cookie = admin_cookie(&app).await;
+
+    // 2. Admins get the module graph and live settings form.
+    let dashboard = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/_zcast/admin")
+                .header(header::COOKIE, &cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(dashboard.status(), StatusCode::OK);
+    assert_eq!(
+        dashboard.headers().get(header::CACHE_CONTROL).unwrap(),
+        "no-store"
+    );
+    let dashboard_html = response_text(dashboard).await;
+    assert!(dashboard_html.contains("data-zcast-module-graph"));
+    assert!(dashboard_html.contains("data-zcast-save-settings"));
+    assert!(dashboard_html.contains("data-zcast-dependency-svg"));
+    assert!(dashboard_html.contains("data-zcast-export-zip"));
+    assert!(dashboard_html.contains("zcast-storage-sqlite"));
+    assert!(dashboard_html.contains("zcast:storage/repository"));
+    assert!(dashboard_html.contains("zcast:io/markdown"));
+
+    // 3. Saving settings persists live (no restart).
+    let save = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/_zcast/admin/settings")
+                .header(header::COOKIE, &cookie)
+                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .body(Body::from(
+                    "site_title=Architectural+Notes&pinned_home_slug=index&color_mode=light",
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(save.status(), StatusCode::SEE_OTHER);
+    assert_eq!(
+        save.headers().get(header::LOCATION).unwrap(),
+        "/_zcast/admin?saved=1"
+    );
+
+    let saved = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/_zcast/admin?saved=1")
+                .header(header::COOKIE, &cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(response_text(saved).await.contains("Settings saved."));
+
+    // 4. `GET /` reflects the new title and colour mode immediately.
+    let home = app
+        .oneshot(
+            Request::builder()
+                .uri("/?preview=public")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(home.status(), StatusCode::OK);
+    let home_html = response_text(home).await;
+    assert!(home_html.contains("Architectural Notes"), "{home_html}");
+    assert!(!home_html.contains("David's Notes"), "{home_html}");
+    assert!(home_html.contains(r#"data-theme="light""#), "{home_html}");
+}
+
+#[tokio::test]
+async fn unauthenticated_admin_settings_write_is_forbidden() {
+    let (kernel, _storage) = admin_io_kernel().await;
+    let app = zcast_kernel::http::router(kernel);
+
+    let resp = app
+        .oneshot(form_request(
+            "POST",
+            "/_zcast/admin/settings",
+            "site_title=Hijacked&pinned_home_slug=index&color_mode=dark".to_owned(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn onnx_search_provider_reports_semantic_capabilities_and_matches_morphology() {
+    let storage = Arc::new(SqliteStorage::connect("sqlite::memory:").await.unwrap());
+    let links = Arc::new(WikilinkParser::new());
+    let theme = Arc::new(DavidHewitsonTheme::new());
+    let kernel = ZcastKernelBuilder::new(KernelConfig::default(), storage, links, theme)
+        .with_search(Arc::new(OnnxSearchProvider::new()))
+        .build()
+        .await
+        .unwrap();
+
+    kernel
+        .create_note(
+            "Architecture Blueprint".into(),
+            "Structural design documents for buildings and public spaces.".into(),
+            false,
+        )
+        .await
+        .unwrap();
+
+    let app = zcast_kernel::http::router(kernel);
+    let (status, data) = send(
+        &app,
+        Request::builder()
+            .uri("/_zcast/search?q=architectural&preview=public")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(data["capabilities"]["topical_semantic"].as_bool().unwrap());
+    assert!(data["capabilities"]["keyword"].as_bool().unwrap());
+
+    let hits = data["hits"].as_array().unwrap();
+    assert!(!hits.is_empty(), "semantic query must find a match: {data}");
+    assert_eq!(hits[0]["slug"], "architecture-blueprint", "{data}");
 }

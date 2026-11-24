@@ -1,10 +1,20 @@
-# `zcast` Quick Start & User Guide (`v0.2.0`)
+# `zcast` Quick Start & User Guide (`v0.4.0`)
 
-Get a working Zettelkasten running locally in under a minute—or deploy it behind Caddy/Nginx with password-protected admin editing.
+Get a working Zettelkasten running in seconds via the one-line installer—or build from source for local authoring or VPS deployment.
 
 ---
 
-## 1. Prerequisites
+## 0. One-Line Install (Prebuilt Static Binaries)
+
+```bash
+curl -sSL https://raw.githubusercontent.com/zcast-cms/zcast/main/installer/install.sh | sh
+```
+
+The bootstrapper detects Linux (`x86_64`/`aarch64` static `musl`) or macOS (`aarch64`/`x86_64`), verifies `SHA256SUMS`, installs `zcast`, and launches the interactive **`zcast setup`** wizard (or runs `zcast update` automatically if `zcast` is already configured).
+
+---
+
+## 1. Building From Source (Prerequisites)
 
 - **Rust toolchain** (edition 2024 / Rust 1.85+ via [rustup](https://rustup.rs))
 - **No Node.js required:** `zcast-editor-inline` ships its TipTap bundle pre-compiled inside the crate, so `cargo build` and `cargo run` are 100% pure Rust.
@@ -153,12 +163,35 @@ server {
 
 ---
 
-## 5. Inspecting Modules
-
-Check all compiled modules, their interface dependencies, and active slot bindings at any time:
+## 5. Operations, Modules, Export/Import & Updates (`v0.4.0`)
 
 ```bash
-cargo run -p zcast-cli -- module list
+# Guided Express / Advanced setup wizard (or non-interactive --express / --local)
+zcast setup
+zcast setup --express --domain notes.example.com --print-systemd
+
+# Inspect modules & dependency graph
+zcast module list
+zcast module graph
+zcast module bind search zcast-search-onnx
+
+# Install / remove / update third-party Rust module crates (xcaddy-style rebuild)
+zcast module install zcast-tags@0.1.0 --dry-run
+
+# Magic-link auth & SSH recovery
+zcast serve --auth magic-link --admin-email you@example.com --public-url https://notes.example.com
+zcast auth login-link --base-url https://notes.example.com
+
+# Full Markdown backup / restore (preserving frontmatter & [[wikilinks]])
+zcast export --out ./notes-backup
+zcast export --zip ./notes-backup.zip
+zcast import ./notes-backup.zip
+
+# Safe update with automatic SQLite VACUUM INTO snapshot & rollback
+zcast update --check
+zcast update
 ```
+
+Visit **`/_zcast/admin`** while signed in to view the visual **Module Dependency Graph**, edit site title / pinned homepage / theme colour mode live (zero restart), or download a `.zip` backup.
 
 See [configuration.md](configuration.md) for full `zcast.toml`, environment variable, theming, and HTTP route documentation.

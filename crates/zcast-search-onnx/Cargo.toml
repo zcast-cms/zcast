@@ -1,0 +1,13 @@
+[package]
+name = "zcast-search-onnx"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Local semantic vector + hybrid SearchProvider for zcast (pure-Rust default + pluggable ONNX embedder)"
+
+[dependencies]
+async-trait.workspace = true
+zcast-interfaces.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true

@@ -2,18 +2,22 @@
 resolver = "2"
 members = [
     "crates/zcast-storage-sqlite",
+    "crates/zcast-storage-mysql",
     "crates/zcast-links-wikilink",
     "crates/zcast-editor-inline",
     "crates/zcast-auth-basic",
+    "crates/zcast-auth-magic-link",
     "crates/zcast-popover",
     "crates/zcast-search-fts",
+    "crates/zcast-search-onnx",
     "crates/zcast-cmd-k",
+    "crates/zcast-io-markdown",
     "crates/zcast-kernel",
     "crates/zcast-cli",
 ]
 
 [workspace.package]
-version = "0.2.0"
+version = "0.4.0"
 edition = "2024"
 license = "MIT"
 repository = "https://github.com/zcast-cms/zcast"
@@ -22,12 +26,16 @@ repository = "https://github.com/zcast-cms/zcast"
 zcast-interfaces = { git = "https://github.com/zcast-cms/zcast-interfaces.git", branch = "main" }
 zcast-theme-davidhewitson = { git = "https://github.com/zcast-cms/zcast-theme-davidhewitson.git", branch = "main" }
 zcast-storage-sqlite = { path = "crates/zcast-storage-sqlite" }
+zcast-storage-mysql = { path = "crates/zcast-storage-mysql" }
 zcast-links-wikilink = { path = "crates/zcast-links-wikilink" }
 zcast-editor-inline = { path = "crates/zcast-editor-inline" }
 zcast-auth-basic = { path = "crates/zcast-auth-basic" }
+zcast-auth-magic-link = { path = "crates/zcast-auth-magic-link" }
 zcast-popover = { path = "crates/zcast-popover" }
 zcast-search-fts = { path = "crates/zcast-search-fts" }
+zcast-search-onnx = { path = "crates/zcast-search-onnx" }
 zcast-cmd-k = { path = "crates/zcast-cmd-k" }
+zcast-io-markdown = { path = "crates/zcast-io-markdown" }
 zcast-kernel = { path = "crates/zcast-kernel" }
 
 ammonia = "4"
@@ -52,3 +60,4 @@ toml = "0.8"
 tower-http = { version = "0.6", features = ["trace"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+zip = { version = "2", default-features = false, features = ["deflate"] }

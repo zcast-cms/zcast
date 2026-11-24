@@ -1,5 +1,5 @@
 use thiserror::Error;
-use zcast_interfaces::{AuthError, LinkError, SearchError, StorageError};
+use zcast_interfaces::{AuthError, IoError, LinkError, SearchError, StorageError};
 
 #[derive(Debug, Error)]
 pub enum KernelError {
@@ -18,7 +18,9 @@ pub enum KernelError {
     },
     #[error("config error: {0}")]
     Config(String),
-    #[error("unsafe bind address '{0}' without an active auth module (bind to 127.0.0.1 or pass --allow-unauthenticated-public)")]
+    #[error(
+        "unsafe bind address '{0}' without an active auth module (bind to 127.0.0.1 or pass --allow-unauthenticated-public)"
+    )]
     UnsafeUnauthenticatedBind(String),
     #[error("not found: {0}")]
     NotFound(String),
@@ -28,4 +30,6 @@ pub enum KernelError {
     Forbidden,
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
+    #[error("module io error: {0}")]
+    IoModule(#[from] IoError),
 }

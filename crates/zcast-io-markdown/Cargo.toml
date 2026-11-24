@@ -1,0 +1,18 @@
+[package]
+name = "zcast-io-markdown"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Markdown directory and zip archive exporter/importer for zcast"
+
+[dependencies]
+async-trait.workspace = true
+chrono.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+zcast-interfaces.workspace = true
+zip.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true
+zcast-storage-sqlite.workspace = true
