@@ -28,10 +28,10 @@ jobs:
             os: ubuntu-latest
             musl: true
           - target: aarch64-apple-darwin
-            os: macos-14
+            os: macos-latest
             musl: false
           - target: x86_64-apple-darwin
-            os: macos-14
+            os: macos-latest
             musl: false
 
     steps:
