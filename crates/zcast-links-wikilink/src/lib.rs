@@ -167,10 +167,8 @@ impl LinkParser for WikilinkParser {
 
         // Match links by title, slug, or either of those for a historical alias so
         // that `[[how-sliding-panes-work]]` resolves just like `[[How Sliding Panes Work]]`.
-        let mut target_names: Vec<String> = vec![
-            target.title.to_lowercase(),
-            target.slug.to_lowercase(),
-        ];
+        let mut target_names: Vec<String> =
+            vec![target.title.to_lowercase(), target.slug.to_lowercase()];
         target_names.extend(
             target
                 .aliases

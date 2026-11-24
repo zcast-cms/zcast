@@ -1,4 +1,4 @@
-# `zcast` Configuration & Reference (`v0.2.0`)
+# `zcast` Configuration & Reference (`v0.4.1`)
 
 ---
 
@@ -76,7 +76,72 @@ zcast --config ./zcast.toml serve
 
 ---
 
-## 4. Theming & `custom.css` Overrides
+## 4. Setup, Auth & Module Commands
+
+### `zcast setup` — automatic Linux production provisioning
+
+`zcast setup` writes `zcast.toml`, initializes the database, seeds the starter
+card, and seeds admin credentials. When run **as root on Linux** for a
+production site it additionally applies a complete, idempotent deployment:
+
+| Step | Details |
+|------|---------|
+| System user | Creates `zcast` (`useradd --system --home-dir /var/lib/zcast --shell /usr/sbin/nologin`) when missing |
+| Directories | `/var/lib/zcast` and `/var/lib/zcast/backups`, chowned `zcast:zcast`, mode `0750` |
+| Config permissions | `/etc/zcast/zcast.toml` chowned `root:zcast`, mode `0640` |
+| systemd | Writes `/etc/systemd/system/zcast.service`, then `daemon-reload`, `enable`, `restart` |
+| Health | Polls `http://<bind_addr>/_zcast/health` (15 tries, 500 ms apart) |
+| Caddy | Appends the site block to `/etc/caddy/Caddyfile` once, reloads Caddy (automatic HTTPS) |
+| Nginx | Writes `/etc/nginx/sites-available/zcast-<domain>`, enables it, `nginx -t`, reloads, then runs Certbot with `--nginx --redirect` when installed |
+| Apache | Writes `/etc/apache2/sites-available/zcast-<domain>.conf`, `a2ensite`, `apachectl configtest`, reloads, then runs Certbot with `--apache` when installed |
+
+When no `--out`/`--config` is passed as root, the config path defaults to
+`/etc/zcast/zcast.toml` and `--db` defaults to
+`sqlite:///var/lib/zcast/zcast.db?mode=rwc`.
+
+A Certbot failure (most commonly because DNS is not pointing at the host yet)
+is a **warning**, not a setup failure: the exact re-run command is printed and
+`zcast` keeps serving over HTTP. Pass `--no-apply` to skip all host mutation
+(systemd, vhosts, TLS) and only write config + database.
+
+### `zcast auth set-password` — rotate the admin password
+
+```bash
+# Generate a strong password (printed once) and revoke all sessions
+zcast auth set-password --generate
+
+# Supply a password non-interactively
+zcast auth set-password --password 'correct horse battery staple'
+
+# Keep existing browser sessions valid
+zcast auth set-password --generate --keep-sessions
+
+# Explicit database and username
+zcast auth set-password --user david --db 'sqlite:///var/lib/zcast/zcast.db?mode=rwc'
+```
+
+Password resolution order: `--generate` → `--password` → `ZCAST_ADMIN_PASSWORD` →
+an interactive masked prompt (entered twice). Empty or whitespace-only
+passwords are rejected. Unless `--keep-sessions` is passed, every stored session
+is revoked and the count is printed. Run as root on Linux, the command also
+best-effort re-owns `<db>-wal` / `<db>-shm` to match the database file so an
+unprivileged `zcast` service can keep writing to the WAL.
+
+### `zcast module activate` / `zcast module deactivate`
+
+```bash
+zcast module deactivate zcast-search-onnx   # disable without deleting the lock entry
+zcast module activate zcast-search-onnx     # re-enable a bundled module
+```
+
+Deactivation is recorded in `zcast-modules.toml` and takes effect on the next
+`zcast serve` restart; no rebuild is needed for bundled modules. `zcast module
+list` and `zcast module graph` print deactivated modules with the exact
+re-enable command.
+
+---
+
+## 5. Theming & `custom.css` Overrides
 
 `zcast-theme-davidhewitson` supports three colour modes:
 - **`dark`** — Server-renders `<html data-theme="dark">` with zero flash-of-wrong-theme and hides the theme toggle.
@@ -104,7 +169,7 @@ See [themes-design.md](themes-design.md) for the complete token and UI-slot cont
 
 ---
 
-## 5. Security & Privacy Model
+## 6. Security & Privacy Model
 
 - **Mandatory `ReadContext` gate:** Every storage query, link render, backlink lookup, hover popover, and search query receives `ReadContext { include_private }`. Unauthenticated visitors (and `?preview=public`) always execute with `include_private: false`, ensuring private notes never leak in HTML, backlinks, popovers, search hits, or link graph boosts.
 - **Unauthenticated bind guard:** Refuses to bind to non-loopback interfaces (`0.0.0.0`, public IP) unless an `AuthProvider` is bound or `--allow-unauthenticated-public` is explicitly passed.
@@ -117,7 +182,7 @@ See [themes-design.md](themes-design.md) for the complete token and UI-slot cont
 
 ---
 
-## 6. HTTP Endpoints Reference (`v0.2.0`)
+## 7. HTTP Endpoints Reference (`v0.4.1`)
 
 ### Public Reader Pages
 | Method & Path | Description |
@@ -154,7 +219,7 @@ See [themes-design.md](themes-design.md) for the complete token and UI-slot cont
 
 ---
 
-## 7. Developing & Testing
+## 8. Developing & Testing
 
 ```bash
 # Run all unit and integration tests across the workspace

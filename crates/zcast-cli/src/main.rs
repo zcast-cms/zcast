@@ -4,6 +4,7 @@ mod update;
 
 use clap::{Parser, Subcommand};
 use std::collections::BTreeMap;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
@@ -119,6 +120,9 @@ enum Commands {
         /// Print systemd unit file for production deployment
         #[arg(long)]
         print_systemd: bool,
+        /// Skip automatic systemd/vhost/TLS provisioning even when running as root
+        #[arg(long)]
+        no_apply: bool,
     },
     /// Safely back up SQLite and update zcast (with SHA-256 verification & auto-rollback)
     Update {
@@ -247,6 +251,24 @@ enum AuthAction {
         #[arg(long)]
         db: Option<String>,
     },
+    /// Set or rotate the basic-auth admin password (revokes sessions by default)
+    SetPassword {
+        /// Admin username (defaults to config admin_user, then "admin")
+        #[arg(long)]
+        user: Option<String>,
+        /// New password (prefer --generate or the interactive prompt)
+        #[arg(long)]
+        password: Option<String>,
+        /// Generate a strong password and print it once
+        #[arg(long)]
+        generate: bool,
+        /// Keep existing login sessions valid
+        #[arg(long)]
+        keep_sessions: bool,
+        /// Database URL override
+        #[arg(long)]
+        db: Option<String>,
+    },
 }
 
 async fn connect_storage(
@@ -273,6 +295,107 @@ fn sqlite_path_from_url(url: &str) -> Option<PathBuf> {
     } else {
         Some(PathBuf::from(path_part))
     }
+}
+
+/// RAII guard that restores terminal echo even on early return or panic.
+struct EchoGuard;
+
+impl EchoGuard {
+    fn disable() -> Self {
+        let _ = Command::new("stty").arg("-echo").status();
+        Self
+    }
+}
+
+impl Drop for EchoGuard {
+    fn drop(&mut self) {
+        let _ = Command::new("stty").arg("echo").status();
+    }
+}
+
+/// Prompt for a secret on the terminal without echoing it.
+fn prompt_masked(prompt: &str) -> Result<String, Box<dyn std::error::Error>> {
+    print!("{prompt}");
+    io::stdout().flush()?;
+
+    let value = {
+        let _guard = EchoGuard::disable();
+        let mut line = String::new();
+        io::stdin().read_line(&mut line)?;
+        line.trim_end_matches(['\r', '\n']).to_owned()
+    };
+    println!();
+
+    Ok(value)
+}
+
+fn prompt_new_password() -> Result<String, Box<dyn std::error::Error>> {
+    let first = prompt_masked("New password: ")?;
+    let second = prompt_masked("Confirm password: ")?;
+    if first != second {
+        return Err("passwords do not match".into());
+    }
+    Ok(first)
+}
+
+/// Best-effort: keep SQLite `-wal` / `-shm` ownership aligned with the DB file
+/// so an unprivileged `zcast` systemd service can still write WAL frames after
+/// an admin rotates the password as root.
+fn preserve_sqlite_sidecar_ownership(database_url: &str) {
+    if !setup::is_linux_root() {
+        return;
+    }
+    let Some(db_path) = sqlite_path_from_url(database_url) else {
+        return;
+    };
+    let db = db_path.display().to_string();
+    for suffix in ["-wal", "-shm"] {
+        let sidecar = PathBuf::from(format!("{db}{suffix}"));
+        if sidecar.exists() {
+            let _ = Command::new("chown")
+                .arg(format!("--reference={db}"))
+                .arg(&sidecar)
+                .status();
+        }
+    }
+}
+
+/// Smoke-check a freshly swapped binary and, when running under systemd,
+/// restart the service and wait for `/_zcast/health`. Rolls back on failure.
+fn verify_and_restart_service(
+    current_exe: &Path,
+    prev: &Path,
+    bind_addr: &str,
+) -> Result<(), String> {
+    let ok = Command::new(current_exe)
+        .arg("--version")
+        .status()
+        .is_ok_and(|status| status.success());
+    if !ok {
+        modules::rollback_binary(prev, current_exe).map_err(|e| e.to_string())?;
+        return Err(
+            "updated binary failed verification; rolled back to previous binary".to_owned(),
+        );
+    }
+
+    if setup::is_linux_root() && update::is_systemd_service_active("zcast.service") {
+        update::restart_systemd_service("zcast.service")?;
+        if update::check_health_endpoint(bind_addr, 20, 500) {
+            println!(
+                "◇  Restarted zcast.service and it is healthy at http://{}/_zcast/health",
+                bind_addr.trim()
+            );
+        } else {
+            modules::rollback_binary(prev, current_exe).map_err(|e| e.to_string())?;
+            let _ = update::restart_systemd_service("zcast.service");
+            return Err(
+                "updated zcast failed its health check; rolled back to the previous binary"
+                    .to_owned(),
+            );
+        }
+    }
+
+    Ok(())
 }
 
 fn module_lock_path(config_path: Option<&Path>) -> PathBuf {
@@ -658,11 +781,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             search,
             out,
             print_systemd,
+            no_apply,
         } => {
             let detected = setup::detect_web_server();
-            let config_path = out
-                .or(cli.config)
-                .unwrap_or_else(|| PathBuf::from("zcast.toml"));
+            let auto_apply = setup::is_linux_root() && !local && !no_apply;
+            let config_path = out.or(cli.config).unwrap_or_else(|| {
+                if auto_apply {
+                    PathBuf::from("/etc/zcast/zcast.toml")
+                } else {
+                    PathBuf::from("zcast.toml")
+                }
+            });
 
             let non_interactive = express || local;
             let defaults = setup::SetupOptions {
@@ -676,7 +805,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         "127.0.0.1:8080".to_owned()
                     }
                 }),
-                database_url: db.unwrap_or_else(|| "sqlite://zcast.db?mode=rwc".to_owned()),
+                database_url: db.unwrap_or_else(|| {
+                    if auto_apply {
+                        "sqlite:///var/lib/zcast/zcast.db?mode=rwc".to_owned()
+                    } else {
+                        "sqlite://zcast.db?mode=rwc".to_owned()
+                    }
+                }),
                 color_mode: theme_mode
                     .as_deref()
                     .map(ThemeColorMode::parse)
@@ -710,6 +845,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             std::fs::write(&opts.config_path, &rendered_toml)?;
             println!("◇  Wrote configuration to {}", opts.config_path.display());
 
+            // Ensure a SQLite database directory exists before connecting (matters
+            // for the root-only /var/lib/zcast default).
+            if let Some(db_path) = sqlite_path_from_url(&opts.database_url)
+                && let Some(parent) = db_path.parent()
+                && !parent.as_os_str().is_empty()
+            {
+                std::fs::create_dir_all(parent)?;
+            }
+
             // Initialize storage and seed starter card immediately.
             let storage = connect_storage(&opts.database_url).await?;
             let kernel_cfg = KernelConfig::load(Some(&opts.config_path))?;
@@ -730,6 +874,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .ensure_admin_credentials(&opts.admin_user, opts.admin_password.as_deref())
                     .await?;
             }
+
+            // Close storage handles before chown + systemd start so WAL files
+            // are flushed cleanly and owned by the unprivileged `zcast` user.
+            drop(_kernel);
+            drop(storage);
+
+            // Automatic, idempotent Linux production provisioning (root only).
+            let provision = if opts.production && setup::is_linux_root() && !no_apply {
+                let bin = std::env::current_exe()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|_| "/usr/local/bin/zcast".to_owned());
+                let work_dir = PathBuf::from("/var/lib/zcast");
+                let report = setup::apply_linux_production_setup(&opts, detected, &bin, &work_dir)?;
+                println!("\n◇  Applied Linux production setup:");
+                for step in &report.steps {
+                    println!("     ✓ {step}");
+                }
+                for warning in &report.warnings {
+                    println!("     ! {warning}");
+                }
+                Some(report)
+            } else {
+                None
+            };
 
             println!("\n└  Setup complete!\n");
             if let Some(domain) = opts.domain.as_deref().filter(|d| !d.is_empty()) {
@@ -758,6 +926,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
 
             if opts.production
+                && !provision
+                    .as_ref()
+                    .is_some_and(|report| report.vhost_configured)
                 && let Some(domain) = opts.domain.as_deref().filter(|d| !d.is_empty())
             {
                 println!(
@@ -781,10 +952,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 );
             }
 
-            println!(
-                "\n   Start zcast now:\n     zcast --config {} serve\n",
-                opts.config_path.display()
-            );
+            if provision
+                .as_ref()
+                .is_some_and(|report| report.service_started)
+            {
+                println!(
+                    "\n   zcast is running as a systemd service. Check it with:\n     systemctl status zcast\n"
+                );
+            } else {
+                println!(
+                    "\n   Start zcast now:\n     zcast --config {} serve\n",
+                    opts.config_path.display()
+                );
+            }
         }
 
         Commands::Update {
@@ -856,6 +1036,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let new_bin = modules::build_custom_binary(&build_dir, &updated_lock, jobs, false)?;
                 let prev = modules::atomic_swap_binary(&new_bin, &current_exe)?;
                 updated_lock.save(&lock_path)?;
+
+                // Smoke-verify the swapped binary, then restart the systemd
+                // service (when applicable) and wait for /_zcast/health.
+                verify_and_restart_service(&current_exe, &prev, &config.bind_addr)?;
+
                 println!(
                     "◇  Swapped custom binary atomically (previous kept at {})",
                     prev.display()
@@ -898,17 +1083,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let prev = modules::atomic_swap_binary(&new_bin, &current_exe)?;
                 let _ = std::fs::remove_dir_all(&tmpdir);
 
-                // Smoke-verify the swapped binary; roll back immediately on failure!
-                let ok = Command::new(&current_exe)
-                    .arg("--version")
-                    .status()
-                    .is_ok_and(|s| s.success());
-                if !ok {
-                    modules::rollback_binary(&prev, &current_exe)?;
-                    return Err(
-                        "updated binary failed verification; rolled back to previous binary".into(),
-                    );
-                }
+                // Smoke-verify the swapped binary, then restart the systemd
+                // service (when applicable) and wait for /_zcast/health.
+                verify_and_restart_service(&current_exe, &prev, &config.bind_addr)?;
 
                 println!(
                     "◇  Updated zcast to v{} (previous kept at {})",
@@ -1162,6 +1339,71 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let provider = MagicLinkAuthProvider::new(storage, admin_email);
             let url = provider.create_cli_login_link(&base).await?;
             println!("{url}");
+        }
+
+        Commands::Auth {
+            action:
+                AuthAction::SetPassword {
+                    user,
+                    password,
+                    generate,
+                    keep_sessions,
+                    db,
+                },
+        } => {
+            if let Some(d) = db {
+                config.database_url = d;
+            }
+
+            let username = user
+                .map(|u| u.trim().to_owned())
+                .filter(|u| !u.is_empty())
+                .unwrap_or_else(|| {
+                    let configured = config.admin_user.trim();
+                    if configured.is_empty() {
+                        "admin".to_owned()
+                    } else {
+                        configured.to_owned()
+                    }
+                });
+
+            // --generate wins over --password, which wins over the environment
+            // variable, which wins over an interactive masked prompt.
+            let new_password = if generate {
+                BasicAuthProvider::generate_password()
+            } else if let Some(pw) = password {
+                pw
+            } else if let Ok(pw) = std::env::var("ZCAST_ADMIN_PASSWORD") {
+                pw
+            } else {
+                prompt_new_password()?
+            };
+
+            if new_password.trim().is_empty() {
+                return Err("password must not be empty".into());
+            }
+
+            let storage = connect_storage(&config.database_url).await?;
+            storage.initialize().await?;
+            let provider = BasicAuthProvider::new(storage);
+            provider
+                .ensure_admin_credentials(&username, Some(&new_password))
+                .await?;
+
+            if keep_sessions {
+                println!("Existing sessions kept valid (--keep-sessions).");
+            } else {
+                let revoked = provider.revoke_all_sessions().await?;
+                println!("Revoked {revoked} active session(s).");
+            }
+
+            // Keep WAL sidecars writable by the unprivileged service user.
+            preserve_sqlite_sidecar_ownership(&config.database_url);
+
+            println!("Password updated for user '{username}'.");
+            if generate {
+                println!("New password: {new_password}   (save this — shown once)");
+            }
         }
 
         Commands::Export {

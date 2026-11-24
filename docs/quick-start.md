@@ -1,4 +1,4 @@
-# `zcast` Quick Start & User Guide (`v0.4.0`)
+# `zcast` Quick Start & User Guide (`v0.4.1`)
 
 Get a working Zettelkasten running in seconds via the one-line installer—or build from source for local authoring or VPS deployment.
 
@@ -98,6 +98,24 @@ ZCAST_ADMIN_PASSWORD="choose-a-strong-password" \
 
 ### Deploying behind a reverse proxy
 
+On a fresh Linux VPS, running `zcast setup` **as root** now provisions the whole
+host automatically:
+
+1. Creates the unprivileged `zcast` system user and `/var/lib/zcast` (mode `0750`, owned `zcast:zcast`).
+2. Secures `/etc/zcast/zcast.toml` as `root:zcast` mode `0640`.
+3. Writes and starts a hardened `/etc/systemd/system/zcast.service` (`ProtectSystem=strict`, `NoNewPrivileges`, writable only under `/var/lib/zcast`).
+4. Waits for `/_zcast/health` before reporting success.
+5. Configures the detected reverse proxy idempotently:
+   - **Caddy** — appends a site block to `/etc/caddy/Caddyfile` (never duplicated) and reloads Caddy; HTTPS is automatic.
+   - **Nginx** — writes `/etc/nginx/sites-available/zcast-<domain>`, enables it, runs `nginx -t`, reloads Nginx, then runs Certbot (`--nginx --redirect`) when available.
+   - **Apache** — writes `/etc/apache2/sites-available/zcast-<domain>.conf`, runs `a2ensite`, `apachectl configtest`, reloads Apache, then runs Certbot (`--apache`) when available.
+
+If Certbot fails because DNS is not pointing at the host yet, setup still
+succeeds and prints the exact command to re-run later. Use `zcast setup --no-apply`
+to write the config and database only, and configure the service/proxy yourself.
+
+To do the same steps by hand:
+
 Build an optimised release binary:
 
 ```bash
@@ -163,11 +181,14 @@ server {
 
 ---
 
-## 5. Operations, Modules, Export/Import & Updates (`v0.4.0`)
+## 5. Operations, Modules, Export/Import & Updates (`v0.4.1`)
 
 ```bash
 # Guided Express / Advanced setup wizard (or non-interactive --express / --local)
+# As root on Linux this also installs systemd + vhost + TLS automatically.
 zcast setup
+zcast setup --express --domain notes.example.com
+zcast setup --express --domain notes.example.com --no-apply   # config/db only
 zcast setup --express --domain notes.example.com --print-systemd
 
 # Inspect modules & dependency graph
@@ -175,8 +196,16 @@ zcast module list
 zcast module graph
 zcast module bind search zcast-search-onnx
 
+# Temporarily disable / re-enable a bundled module (no rebuild needed)
+zcast module deactivate zcast-popover
+zcast module activate zcast-popover
+
 # Install / remove / update third-party Rust module crates (xcaddy-style rebuild)
 zcast module install zcast-tags@0.1.0 --dry-run
+
+# Password rotation (revokes every active session unless --keep-sessions)
+zcast auth set-password --generate
+zcast auth set-password --user admin --password 's3cret' --keep-sessions
 
 # Magic-link auth & SSH recovery
 zcast serve --auth magic-link --admin-email you@example.com --public-url https://notes.example.com
@@ -191,6 +220,10 @@ zcast import ./notes-backup.zip
 zcast update --check
 zcast update
 ```
+
+> When `zcast` runs under systemd and you run `zcast update` as root, the updater
+> restarts `zcast.service` after the binary swap, polls `/_zcast/health`, and
+> automatically rolls back to the previous binary if the new one is unhealthy.
 
 Visit **`/_zcast/admin`** while signed in to view the visual **Module Dependency Graph**, edit site title / pinned homepage / theme colour mode live (zero restart), or download a `.zip` backup.
 

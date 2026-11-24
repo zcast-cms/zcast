@@ -2979,7 +2979,7 @@ dependencies = [
 
 [[package]]
 name = "zcast-auth-basic"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "argon2",
  "async-trait",
@@ -2997,7 +2997,7 @@ dependencies = [
 
 [[package]]
 name = "zcast-auth-magic-link"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "async-trait",
  "chrono",
@@ -3015,7 +3015,7 @@ dependencies = [
 
 [[package]]
 name = "zcast-cli"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "axum",
  "chrono",
@@ -3047,7 +3047,7 @@ dependencies = [
 
 [[package]]
 name = "zcast-cmd-k"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "maud",
  "rust-embed",
@@ -3056,7 +3056,7 @@ dependencies = [
 
 [[package]]
 name = "zcast-editor-inline"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "chrono",
  "maud",
@@ -3079,7 +3079,7 @@ dependencies = [
 
 [[package]]
 name = "zcast-io-markdown"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "async-trait",
  "chrono",
@@ -3093,7 +3093,7 @@ dependencies = [
 
 [[package]]
 name = "zcast-kernel"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "async-trait",
  "axum",
@@ -3124,7 +3124,7 @@ dependencies = [
 
 [[package]]
 name = "zcast-links-wikilink"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "ammonia",
  "async-trait",
@@ -3139,7 +3139,7 @@ dependencies = [
 
 [[package]]
 name = "zcast-popover"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "maud",
  "rust-embed",
@@ -3148,7 +3148,7 @@ dependencies = [
 
 [[package]]
 name = "zcast-search-fts"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "async-trait",
  "tokio",
@@ -3157,7 +3157,7 @@ dependencies = [
 
 [[package]]
 name = "zcast-search-onnx"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "async-trait",
  "tokio",
@@ -3166,7 +3166,7 @@ dependencies = [
 
 [[package]]
 name = "zcast-storage-mysql"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "async-trait",
  "chrono",
@@ -3179,7 +3179,7 @@ dependencies = [
 
 [[package]]
 name = "zcast-storage-sqlite"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "async-trait",
  "chrono",

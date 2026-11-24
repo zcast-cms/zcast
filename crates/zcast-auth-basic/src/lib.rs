@@ -254,6 +254,27 @@ impl BasicAuthProvider {
         Ok(generated)
     }
 
+    /// Revoke every stored session, returning how many were deleted.
+    ///
+    /// The admin credential (`user:admin`) is never touched, so the account can
+    /// be signed into again immediately. Useful after rotating a password via
+    /// `zcast auth set-password`.
+    pub async fn revoke_all_sessions(&self) -> Result<usize, AuthError> {
+        let store = self.store();
+        let sessions = store
+            .list_prefix(SESSION_KEY_PREFIX, None)
+            .await
+            .map_err(backend)?;
+
+        let mut revoked = 0usize;
+        for (key, _value) in sessions {
+            store.delete(&key).await.map_err(backend)?;
+            revoked += 1;
+        }
+
+        Ok(revoked)
+    }
+
     /// Generate a human-readable password: four dash-separated groups of four
     /// unambiguous alphanumeric characters (e.g. `k9M4-vP2x-Q7rL-8nTz`).
     pub fn generate_password() -> String {
@@ -726,6 +747,78 @@ mod tests {
                 .await
                 .expect("validate after revoke")
                 .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn revoke_all_sessions_revokes_every_session_and_keeps_admin_credentials() {
+        let provider = provider().await;
+        provider
+            .ensure_admin_credentials("admin", Some("hunter2"))
+            .await
+            .expect("ensure");
+
+        let first = provider
+            .authenticate("admin", "hunter2")
+            .await
+            .expect("authenticate first")
+            .expect("first token");
+        let second = provider
+            .authenticate("admin", "hunter2")
+            .await
+            .expect("authenticate second")
+            .expect("second token");
+        let third = provider
+            .authenticate("admin", "hunter2")
+            .await
+            .expect("authenticate third")
+            .expect("third token");
+
+        assert_ne!(first, second);
+
+        let revoked = provider.revoke_all_sessions().await.expect("revoke all");
+        assert_eq!(revoked, 3, "three active sessions were revoked");
+
+        for token in [&first, &second, &third] {
+            assert!(
+                provider
+                    .validate_session(token)
+                    .await
+                    .expect("validate revoked")
+                    .is_none()
+            );
+        }
+
+        // The credential document survives, so the user can log in again.
+        assert!(
+            provider
+                .store()
+                .get(ADMIN_USER_KEY)
+                .await
+                .expect("admin lookup")
+                .is_some()
+        );
+        assert!(
+            provider
+                .authenticate("admin", "hunter2")
+                .await
+                .expect("authenticate after revoke")
+                .is_some()
+        );
+
+        // A second sweep is a no-op (only the new session above remains).
+        assert_eq!(
+            provider.revoke_all_sessions().await.expect("revoke again"),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn revoke_all_sessions_without_sessions_returns_zero() {
+        let provider = provider().await;
+        assert_eq!(
+            provider.revoke_all_sessions().await.expect("revoke none"),
+            0
         );
     }
 

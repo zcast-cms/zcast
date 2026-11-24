@@ -13,6 +13,8 @@ use sha2::{Digest, Sha256};
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePool};
 use std::cmp::Ordering;
 use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::time::Duration;
 
 /// Default GitHub repository used for release downloads.
 pub const DEFAULT_RELEASE_REPO: &str = "zcast-cms/zcast";
@@ -50,6 +52,63 @@ pub fn current_target_triple() -> &'static str {
 
 fn sql_quote(path: &Path) -> String {
     path.to_string_lossy().replace('\'', "''")
+}
+
+/// Poll `http://<bind_addr>/_zcast/health` until it answers or attempts run out.
+///
+/// Each probe is `curl -fsS --max-time 2`, so a hung server cannot stall the
+/// updater for long. `delay_ms` is the wait between failed attempts.
+pub fn check_health_endpoint(bind_addr: &str, attempts: usize, delay_ms: u64) -> bool {
+    let url = format!("http://{}/_zcast/health", bind_addr.trim());
+
+    for attempt in 0..attempts {
+        if attempt > 0 && delay_ms > 0 {
+            std::thread::sleep(Duration::from_millis(delay_ms));
+        }
+        let healthy = Command::new("curl")
+            .args(["-fsS", "--max-time", "2", &url])
+            .output()
+            .is_ok_and(|out| out.status.success());
+        if healthy {
+            return true;
+        }
+    }
+
+    false
+}
+
+/// True when `service` is active according to systemd (always false off Linux).
+pub fn is_systemd_service_active(service: &str) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        Command::new("systemctl")
+            .args(["is-active", "--quiet", service])
+            .output()
+            .is_ok_and(|out| out.status.success())
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = service;
+        false
+    }
+}
+
+/// Restart a systemd service, surfacing its stderr on failure.
+pub fn restart_systemd_service(service: &str) -> Result<(), String> {
+    let output = Command::new("systemctl")
+        .args(["restart", service])
+        .output()
+        .map_err(|e| format!("failed to run systemctl restart {service}: {e}"))?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stderr = stderr.trim();
+    if stderr.is_empty() {
+        Err(format!("systemctl restart {service} failed"))
+    } else {
+        Err(format!("systemctl restart {service} failed: {stderr}"))
+    }
 }
 
 /// Take a consistent hot snapshot of the SQLite database via `VACUUM INTO`.
@@ -485,6 +544,17 @@ mod tests {
         assert!(plan.is_custom_module_build);
         assert!(plan.download_url.contains("/v0.5.0/"));
         assert!(!plan.download_url.contains("//releases"));
+    }
+
+    #[test]
+    fn health_check_with_no_attempts_is_false() {
+        assert!(!check_health_endpoint("127.0.0.1:1", 0, 0));
+    }
+
+    #[test]
+    fn health_check_against_closed_port_is_false() {
+        // Nothing listens on port 1; curl fails fast with a connection error.
+        assert!(!check_health_endpoint("127.0.0.1:1", 1, 0));
     }
 
     #[test]
