@@ -430,6 +430,121 @@
   display: none;
 }
 
+/* External link chrome: a caret inside a real <a> keeps only the link actions. */
+.zcast-toolbar-link,
+.zcast-toolbar-unlink,
+.zcast-toolbar-open-ext {
+  color: var(--zcast-accent);
+}
+
+.zcast-toolbar-link[data-active="true"],
+.zcast-toolbar-link.is-active {
+  background: var(--zcast-accent);
+  color: var(--zcast-bg);
+}
+
+.zcast-editor-toolbar[data-mode="link"] .zcast-toolbar-btn:not(.zcast-toolbar-link):not(.zcast-toolbar-unlink):not(.zcast-toolbar-open-ext),
+.zcast-editor-toolbar[data-mode="link"] .zcast-toolbar-sep:not(.zcast-toolbar-sep-open) {
+  display: none;
+}
+
+/* -------------------------------------------------------------------------- */
+/* Inline URL bar (external links)                                            */
+/* -------------------------------------------------------------------------- */
+
+/* The bar replaces the formatting buttons in place, so the toolbar never jumps
+ * and the TipTap selection survives while the input holds focus. */
+.zcast-editor-toolbar[data-mode="url"] [data-zcast-action],
+.zcast-editor-toolbar[data-mode="url"] .zcast-toolbar-sep {
+  display: none;
+}
+
+.zcast-toolbar-url-form {
+  display: flex;
+  flex-wrap: nowrap;
+  align-items: center;
+  gap: 4px;
+  min-width: min(24rem, calc(100vw - 24px));
+}
+
+.zcast-toolbar-url-form[hidden] {
+  display: none;
+}
+
+.zcast-toolbar-url-input {
+  flex: 1 1 auto;
+  min-width: 0;
+  height: 1.9em;
+  padding: 0 0.5em;
+  border: 1px solid var(--zcast-border);
+  border-radius: calc(var(--zcast-radius) / 1.5);
+  background: var(--zcast-surface-elevated, var(--zcast-surface));
+  color: var(--zcast-text);
+  font-family: var(--zcast-font-mono);
+  font-size: 0.78em;
+  line-height: 1.2;
+}
+
+.zcast-toolbar-url-input::placeholder {
+  color: var(--zcast-text-muted);
+}
+
+.zcast-toolbar-url-input:focus,
+.zcast-toolbar-url-input:focus-visible {
+  border-color: var(--zcast-accent);
+  outline: 2px solid var(--zcast-accent);
+  outline-offset: 1px;
+}
+
+.zcast-toolbar-url-apply {
+  background: var(--zcast-accent);
+  color: var(--zcast-bg);
+  font-weight: 700;
+}
+
+.zcast-toolbar-url-apply:hover {
+  background: var(--zcast-accent);
+  color: var(--zcast-bg);
+  opacity: 0.85;
+}
+
+.zcast-toolbar-url-unlink {
+  color: var(--zcast-accent);
+}
+
+.zcast-toolbar-url-unlink[hidden] {
+  display: none;
+}
+
+.zcast-toolbar-url-cancel {
+  min-width: 1.4em;
+  padding: 0 0.3em;
+  color: var(--zcast-text-muted);
+  font-size: 0.95em;
+}
+
+/* Empty/unsafe targets are rejected with a quiet shake, never a dialog. */
+.zcast-toolbar-url-form--invalid .zcast-toolbar-url-input,
+.zcast-toolbar-url-input[aria-invalid="true"] {
+  border-color: var(--zcast-accent);
+  animation: zcast-toolbar-url-shake 200ms ease-in-out 2;
+}
+
+@keyframes zcast-toolbar-url-shake {
+  0%,
+  100% {
+    transform: translateX(0);
+  }
+
+  25% {
+    transform: translateX(-3px);
+  }
+
+  75% {
+    transform: translateX(3px);
+  }
+}
+
 /* -------------------------------------------------------------------------- */
 /* [[wikilink]] autocomplete                                                  */
 /* -------------------------------------------------------------------------- */
@@ -586,8 +701,14 @@ a[data-zcast-unresolved] {
 @media (prefers-reduced-motion: reduce) {
   .zcast-btn,
   .zcast-header-btn,
-  .zcast-toolbar-btn {
+  .zcast-toolbar-btn,
+  .zcast-toolbar-url-input {
     transition: none;
+  }
+
+  .zcast-toolbar-url-form--invalid .zcast-toolbar-url-input,
+  .zcast-toolbar-url-input[aria-invalid="true"] {
+    animation: none;
   }
 
   .zcast-card-draft,

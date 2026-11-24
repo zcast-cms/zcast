@@ -5,7 +5,7 @@
  * 100% pure Rust with no Node.js dependency.
  */
 
-import { Editor, Extension } from '@tiptap/core';
+import { Editor, Extension, InputRule } from '@tiptap/core';
 import StarterKit from '@tiptap/starter-kit';
 import Link from '@tiptap/extension-link';
 import Underline from '@tiptap/extension-underline';
@@ -98,6 +98,63 @@ const WikilinkDecorations = Extension.create({
   },
 });
 
+/* Schemes that must never reach an <a href>. */
+const UNSAFE_LINK_PROTOCOL = /^(javascript|data|vbscript):/i;
+const LINK_SCHEME = /^[a-z][a-z0-9+.-]*:/i;
+
+/**
+ * Trim and normalise a typed/pasted link target. Returns `''` when the value is
+ * empty or uses an unsafe protocol, so callers can reject it in one check.
+ */
+function normaliseLinkHref(raw) {
+  const value = String(raw ?? '').trim();
+  if (!value) return '';
+
+  // Control characters and spaces can smuggle past a naive protocol check.
+  const probe = value.replace(/[\u0000-\u0020\u007f]/g, '');
+  if (UNSAFE_LINK_PROTOCOL.test(probe)) return '';
+
+  if (value.startsWith('//')) return `https:${value}`;
+  if (LINK_SCHEME.test(value) || value.startsWith('/') || value.startsWith('#')) {
+    return value;
+  }
+
+  return `https://${value}`;
+}
+
+/**
+ * Typing `[label](https://example.com)` becomes a real link mark once the
+ * closing `)` is typed. The leading-`[` guard keeps `[[wikilinks]]` untouched.
+ */
+const MarkdownLinkInputRule = Extension.create({
+  name: 'zcastMarkdownLinkInputRule',
+  addInputRules() {
+    const linkType = this.editor.schema.marks.link;
+    if (!linkType) return [];
+
+    return [
+      new InputRule({
+        find: /(?<!\[)\[([^\[\]\n]+)\]\(([^()\s]+)\)$/,
+        handler: ({ state, range, match }) => {
+          const label = match[1] || '';
+          const href = normaliseLinkHref(match[2]);
+          if (!label || !href) return null;
+
+          const parent = state.doc.resolve(range.from).parent;
+          if (parent.type.spec.code) return null;
+
+          state.tr.replaceWith(
+            range.from,
+            range.to,
+            state.schema.text(label, [linkType.create({ href })]),
+          );
+          state.tr.removeStoredMark(linkType);
+        },
+      }),
+    ];
+  },
+});
+
 function editorExtensions() {
   return [
     StarterKit.configure({
@@ -115,6 +172,7 @@ function editorExtensions() {
       placeholder: 'Start writing… Use [[Title]] to link another note.',
     }),
     WikilinkDecorations,
+    MarkdownLinkInputRule,
   ];
 }
 
@@ -1016,7 +1074,8 @@ function mountEditor(state, focusMode, options = {}) {
       },
       handleKeyDown: (_view, event) => handleEditorKeyDown(state, event),
       handleClick: (view, pos, event) =>
-        handleEditorWikilinkClick(state, view, pos, event),
+        handleEditorWikilinkClick(state, view, pos, event) ||
+        handleEditorExternalLinkClick(state, view, pos, event),
     },
     onUpdate: ({ editor: current }) => {
       if (!state.editing) return;
@@ -1032,7 +1091,13 @@ function mountEditor(state, focusMode, options = {}) {
     },
     onBlur: () => {
       window.setTimeout(() => {
-        if (toolbarOwner === state && !autocomplete.open) hideFloatingToolbar();
+        if (toolbarOwner !== state) return;
+        if (linkBar.open && linkBar.state === state) return;
+        if (autocomplete.open) return;
+        // Focus can legitimately move into the toolbar's inline URL input.
+        const active = document.activeElement;
+        if (active && floatingToolbar?.contains(active)) return;
+        hideFloatingToolbar();
       }, 140);
     },
   });
@@ -1597,7 +1662,36 @@ function handleEditorKeyDown(state, event) {
     return true;
   }
 
+  // Alt/Mod+Shift+K opens the inline URL bar. Plain Cmd/Ctrl+K belongs to
+  // zcast-cmd-k (global search) and must stay untouched.
+  if (
+    (event.metaKey || event.ctrlKey) &&
+    event.shiftKey &&
+    event.key.toLowerCase() === 'k'
+  ) {
+    event.preventDefault();
+    if (state?.editor) openLinkBar(state, state.editor);
+    return true;
+  }
+
   return false;
+}
+
+/** `Cmd+Click` / `Ctrl+Click` on an external `<a>` opens it in a new tab. */
+function handleEditorExternalLinkClick(state, view, pos, event) {
+  if (!(event.metaKey || event.ctrlKey)) return false;
+
+  const element = eventElement(event);
+  const anchor = element?.closest?.('a[href]');
+  if (!anchor || !view.dom.contains(anchor)) return false;
+
+  const href = String(anchor.getAttribute('href') || '').trim();
+  if (!href) return false;
+
+  event.preventDefault();
+  event.stopPropagation();
+  window.open(href, '_blank', 'noopener,noreferrer');
+  return true;
 }
 
 /** `Cmd+Click` / `Ctrl+Click` on a `[[wikilink]]` follows it in-pane. */
@@ -1734,9 +1828,35 @@ const TOOLBAR_ACTIONS = [
   ['code', 'Code', 'Inline code', 'zcast-toolbar-code'],
   ['sep'],
   ['wikilink', '[[Link]]', 'Wrap selection in a wikilink', 'zcast-toolbar-wikilink'],
+  ['externalLink', 'Link', 'Add or edit external URL link', 'zcast-toolbar-link'],
+  ['unlink', 'Unlink', 'Remove link', 'zcast-toolbar-unlink'],
   ['sep', '', '', 'zcast-toolbar-sep-open'],
   ['openWikilink', 'Open ↗', 'Open the linked note in a pane to the right', 'zcast-toolbar-open-link'],
+  ['openExternalLink', 'Open ↗', 'Open external link in a new tab', 'zcast-toolbar-open-ext'],
 ];
+
+/** Buttons that reflect a formatting state and therefore own `aria-pressed`. */
+const TOOLBAR_TOGGLES = new Set([
+  'bold',
+  'italic',
+  'underline',
+  'heading2',
+  'heading3',
+  'bulletList',
+  'orderedList',
+  'blockquote',
+  'code',
+]);
+
+/** Inline URL bar state (no `window.prompt()` anywhere). */
+const linkBar = {
+  open: false,
+  state: null,
+  /** TipTap selection to restore when the bar closes. */
+  selection: null,
+  /** True when the caret/selection already sat inside a link mark. */
+  editing: false,
+};
 
 function ensureFloatingToolbar() {
   if (floatingToolbar) return floatingToolbar;
@@ -1747,24 +1867,289 @@ function ensureFloatingToolbar() {
   toolbar.dataset.mode = 'selection';
   toolbar.setAttribute('role', 'toolbar');
   toolbar.setAttribute('aria-label', 'Text formatting');
-  toolbar.innerHTML = TOOLBAR_ACTIONS.map(([action, label, title, className]) => {
+  toolbar.innerHTML = `${TOOLBAR_ACTIONS.map(([action, label, title, className]) => {
     if (action === 'sep') {
       const extra = className ? ` ${className}` : '';
       return `<span class="zcast-toolbar-sep${extra}" aria-hidden="true"></span>`;
     }
     return `<button type="button" class="zcast-toolbar-btn ${className}" data-zcast-action="${action}" title="${escapeHtml(title)}" aria-label="${escapeHtml(title)}">${escapeHtml(label)}</button>`;
-  }).join('');
+  }).join('')}<form class="zcast-toolbar-url-form" hidden novalidate autocomplete="off">
+    <input type="url" class="zcast-toolbar-url-input" placeholder="https://…" aria-label="Link URL" spellcheck="false" autocomplete="off" />
+    <button type="submit" class="zcast-toolbar-btn zcast-toolbar-url-apply" title="Apply link" aria-label="Apply link">Apply</button>
+    <button type="button" class="zcast-toolbar-btn zcast-toolbar-url-unlink" data-zcast-url-unlink title="Remove link" aria-label="Remove link" hidden>Unlink</button>
+    <button type="button" class="zcast-toolbar-btn zcast-toolbar-url-cancel" data-zcast-url-cancel title="Cancel" aria-label="Cancel link editing">×</button>
+  </form>`;
 
-  toolbar.addEventListener('mousedown', (event) => event.preventDefault());
+  // Keep the editor selection alive when a toolbar button is pressed, but let
+  // the inline URL input receive real focus.
+  toolbar.addEventListener('mousedown', (event) => {
+    if (eventElement(event)?.closest?.('.zcast-toolbar-url-form')) return;
+    event.preventDefault();
+  });
   toolbar.addEventListener('click', (event) => {
     const button = eventElement(event)?.closest('[data-zcast-action]');
     if (!button || !toolbarOwner?.editor) return;
     runToolbarAction(toolbarOwner, button.dataset.zcastAction || '');
   });
 
+  const form = toolbar.querySelector('.zcast-toolbar-url-form');
+  form.addEventListener('submit', (event) => {
+    event.preventDefault();
+    if (linkBar.state) applyLinkBarValue(linkBar.state);
+  });
+  form.addEventListener('mousedown', (event) => {
+    // Buttons must not swallow focus from the URL input mid-edit.
+    if (eventElement(event)?.closest?.('button')) event.preventDefault();
+  });
+  form.addEventListener('keydown', (event) => {
+    if (event.key === 'Escape') {
+      event.preventDefault();
+      event.stopPropagation();
+      closeLinkBar({ restore: true });
+      return;
+    }
+    if (event.key === 'Enter' && eventElement(event)?.matches?.('.zcast-toolbar-url-input')) {
+      event.preventDefault();
+      event.stopPropagation();
+      if (linkBar.state) applyLinkBarValue(linkBar.state);
+    }
+  });
+  form.querySelector('[data-zcast-url-unlink]').addEventListener('click', () => {
+    if (linkBar.state) applyLinkBarValue(linkBar.state, { unlink: true });
+  });
+  form.querySelector('[data-zcast-url-cancel]').addEventListener('click', () => {
+    closeLinkBar({ restore: true });
+  });
+
   document.body.appendChild(toolbar);
   floatingToolbar = toolbar;
   return toolbar;
+}
+
+function linkBarForm() {
+  return floatingToolbar?.querySelector?.('.zcast-toolbar-url-form') || null;
+}
+
+function linkBarInput() {
+  return linkBarForm()?.querySelector('.zcast-toolbar-url-input') || null;
+}
+
+/** The external `<a href>` the current selection sits inside, if any. */
+function externalLinkAnchor(editor) {
+  if (!editor) return null;
+  const dom = editor.view.dom;
+  const { from } = editor.state.selection;
+  const candidates = [from, Math.max(1, from - 1), from + 1];
+
+  for (const pos of candidates) {
+    try {
+      const { node } = editor.view.domAtPos(pos);
+      const element = node?.nodeType === 1 ? node : node?.parentElement;
+      const anchor = element?.closest?.('a[href]') || null;
+      if (anchor && dom.contains(anchor)) return anchor;
+    } catch {
+      // Ignore positions that cannot be resolved and try the next one.
+    }
+  }
+
+  return null;
+}
+
+/** Bounding rect of the external link under a collapsed caret. */
+function externalLinkRect(editor) {
+  const anchor = externalLinkAnchor(editor);
+  if (anchor) {
+    const rect = anchor.getBoundingClientRect();
+    if (rect.width || rect.height) return rect;
+  }
+
+  try {
+    const { from } = editor.state.selection;
+    const start = editor.view.coordsAtPos(from);
+    const end = editor.view.coordsAtPos(Math.max(from, from + 1));
+    return {
+      top: Math.min(start.top, end.top),
+      bottom: Math.max(start.bottom, end.bottom),
+      left: start.left,
+      right: start.left,
+      width: 0,
+      height: Math.max(1, end.bottom - start.top),
+    };
+  } catch {
+    return null;
+  }
+}
+
+/** Open the inline URL bar for the current selection/link. */
+function openLinkBar(state, editor = state?.editor) {
+  if (!editor) return false;
+
+  const { from, to } = editor.state.selection;
+  const editing = editor.isActive('link');
+  let selection = { from, to };
+
+  // Widen to the whole mark so re-applying replaces the link cleanly.
+  if (editing && editor.commands.extendMarkRange('link')) {
+    selection = {
+      from: editor.state.selection.from,
+      to: editor.state.selection.to,
+    };
+  }
+
+  const href = editing ? String(editor.getAttributes('link')?.href || '') : '';
+  const toolbar = ensureFloatingToolbar();
+  const form = linkBarForm();
+  const input = linkBarInput();
+  if (!form || !input) return false;
+
+  linkBar.open = true;
+  linkBar.state = state;
+  linkBar.selection = selection;
+  linkBar.editing = editing;
+
+  toolbarOwner = state;
+  toolbar.hidden = false;
+  toolbar.dataset.mode = 'url';
+  form.hidden = false;
+  form.querySelector('[data-zcast-url-unlink]').hidden = !linkBar.editing;
+
+  clearLinkBarError(form);
+  input.value = href;
+
+  const rect = toolbarAnchorRect(editor, selection);
+  if (rect) positionToolbar(toolbar, rect);
+
+  input.focus();
+  input.select();
+  return true;
+}
+
+/** Viewport rect used to anchor the toolbar for a stored selection. */
+function toolbarAnchorRect(editor, selection) {
+  const anchor = externalLinkAnchor(editor);
+  if (anchor) {
+    const rect = anchor.getBoundingClientRect();
+    if (rect.width || rect.height) return rect;
+  }
+
+  try {
+    const start = editor.view.coordsAtPos(selection.from);
+    const end = editor.view.coordsAtPos(Math.max(selection.from, selection.to));
+    const top = Math.min(start.top, end.top);
+    const bottom = Math.max(start.bottom, end.bottom);
+    const left = Math.min(start.left, end.left);
+    const right = Math.max(start.right, end.right);
+    return {
+      top,
+      bottom,
+      left,
+      right,
+      width: Math.max(0, right - left),
+      height: Math.max(0, bottom - top),
+    };
+  } catch {
+    return null;
+  }
+}
+
+function clearLinkBarError(form = linkBarForm()) {
+  if (!form) return;
+  const input = form.querySelector('.zcast-toolbar-url-input');
+  input?.removeAttribute('aria-invalid');
+  form.classList.remove('zcast-toolbar-url-form--invalid');
+}
+
+/** Subtle inline rejection (no alerts, no prompts). */
+function showLinkBarError() {
+  const form = linkBarForm();
+  const input = linkBarInput();
+  if (!form || !input) return;
+
+  input.setAttribute('aria-invalid', 'true');
+  form.classList.add('zcast-toolbar-url-form--invalid');
+  window.setTimeout(() => clearLinkBarError(form), 900);
+  input.focus();
+}
+
+/** Apply the URL bar value to the editor. */
+function applyLinkBarValue(state, options = {}) {
+  const editor = state?.editor;
+  const input = linkBarInput();
+  if (!editor || !input) return false;
+
+  const selection = linkBar.selection || {
+    from: editor.state.selection.from,
+    to: editor.state.selection.to,
+  };
+  const raw = options.unlink ? '' : String(input.value || '').trim();
+
+  if (!raw) {
+    editor.chain().focus().setTextSelection(selection).extendMarkRange('link').unsetLink().run();
+    closeLinkBar({ restore: false });
+    state.dirty = true;
+    scheduleSave(state);
+    window.requestAnimationFrame(() => updateFloatingToolbar(state));
+    return true;
+  }
+
+  const href = normaliseLinkHref(raw);
+  if (!href) {
+    showLinkBarError();
+    return false;
+  }
+
+  editor
+    .chain()
+    .focus()
+    .setTextSelection(selection)
+    .extendMarkRange('link')
+    .setLink({ href })
+    .run();
+
+  closeLinkBar({ restore: false });
+  state.dirty = true;
+  scheduleSave(state);
+  window.requestAnimationFrame(() => updateFloatingToolbar(state));
+  return true;
+}
+
+/** Close the URL bar, optionally restoring editor focus + selection. */
+function closeLinkBar({ restore = false, silent = false } = {}) {
+  const form = linkBarForm();
+  const state = linkBar.state;
+  const selection = linkBar.selection;
+
+  linkBar.open = false;
+  linkBar.state = null;
+  linkBar.selection = null;
+  linkBar.editing = false;
+
+  if (form) {
+    form.hidden = true;
+    clearLinkBarError(form);
+  }
+  if (floatingToolbar) floatingToolbar.dataset.mode = 'selection';
+
+  if (restore && state?.editor && selection) {
+    try {
+      state.editor.chain().focus().setTextSelection(selection).run();
+    } catch {
+      // The pane may have been closed while the bar was open.
+    }
+  }
+
+  if (!silent && state) {
+    window.requestAnimationFrame(() => updateFloatingToolbar(state));
+  }
+}
+
+/** `Open ↗` for an external link (never navigates the current tab). */
+function openExternalHref(editor) {
+  if (!editor?.isActive('link')) return false;
+  const href = String(editor.getAttributes('link')?.href || '').trim();
+  if (!href) return false;
+  window.open(href, '_blank', 'noopener,noreferrer');
+  return true;
 }
 
 function runToolbarAction(state, action) {
@@ -1776,6 +2161,26 @@ function runToolbarAction(state, action) {
   if (action === 'openWikilink') {
     const link = toolbarWikilink(state);
     if (link) void navigateWikilinkTarget(link.target, state.card);
+    return;
+  }
+
+  // "Open ↗" for an external link, likewise without touching the selection.
+  if (action === 'openExternalLink') {
+    openExternalHref(editor);
+    return;
+  }
+
+  // The inline URL bar manages its own focus/selection restoration.
+  if (action === 'externalLink') {
+    openLinkBar(state, editor);
+    return;
+  }
+
+  if (action === 'unlink') {
+    editor.chain().focus().extendMarkRange('link').unsetLink().run();
+    state.dirty = true;
+    scheduleSave(state);
+    window.requestAnimationFrame(() => updateFloatingToolbar(state));
     return;
   }
 
@@ -1842,6 +2247,13 @@ function updateFloatingToolbar(state) {
     return;
   }
 
+  // The inline URL bar owns the toolbar while it is open.
+  if (linkBar.open && linkBar.state === state) {
+    toolbarOwner = state;
+    if (floatingToolbar) floatingToolbar.hidden = false;
+    return;
+  }
+
   // The [[wikilink]] autocomplete owns the caret while it is open.
   if (autocomplete.open && autocomplete.state === state) {
     hideFloatingToolbar();
@@ -1864,14 +2276,20 @@ function updateFloatingToolbar(state) {
 
   const collapsed = editor.state.selection.empty;
   const link = toolbarWikilink(state);
+  // A link mark only counts when it is not a [[wikilink]] decoration.
+  const activeLink = !link && editor.isActive('link');
 
-  // A bare caret only earns a toolbar while it sits inside a [[wikilink]].
-  if (collapsed && !link) {
+  // A bare caret only earns a toolbar inside a [[wikilink]] or a real link.
+  if (collapsed && !link && !activeLink) {
     hideFloatingToolbar();
     return;
   }
 
-  const rect = collapsed ? wikilinkRect(editor, link) : range.getBoundingClientRect();
+  const rect = collapsed
+    ? link
+      ? wikilinkRect(editor, link)
+      : externalLinkRect(editor)
+    : range.getBoundingClientRect();
   if (!rect || (rect.width === 0 && rect.height === 0)) {
     hideFloatingToolbar();
     return;
@@ -1880,7 +2298,7 @@ function updateFloatingToolbar(state) {
   const toolbar = ensureFloatingToolbar();
   toolbarOwner = state;
   toolbar.hidden = false;
-  syncToolbarVisibility({ link, collapsed });
+  syncToolbarVisibility({ link, collapsed, activeLink });
   syncToolbarState(state);
   positionToolbar(toolbar, rect);
 }
@@ -1894,28 +2312,54 @@ function toolbarWikilink(state) {
   return findWikilinkInRange(editor.state.doc, from, to);
 }
 
-/** Collapsed-caret mode: only `Open ↗`, nothing else. */
-function syncToolbarVisibility({ link = null, collapsed = false } = {}) {
+/**
+ * Toolbar modes:
+ * - `selection`      — formatting chrome while text is selected
+ * - `link`           — collapsed caret inside an external link
+ * - `wikilink-only`  — collapsed caret inside a [[wikilink]]
+ * - `url`            — the inline URL bar is open
+ */
+function syncToolbarVisibility({ link = null, collapsed = false, activeLink = false } = {}) {
   if (!floatingToolbar) return;
 
-  floatingToolbar.dataset.mode = collapsed ? 'wikilink-only' : 'selection';
+  floatingToolbar.dataset.mode = link ? 'wikilink-only' : collapsed ? 'link' : 'selection';
 
   if (link) floatingToolbar.dataset.zcastWikilinkTarget = link.target;
   else delete floatingToolbar.dataset.zcastWikilinkTarget;
 
-  const showOpen = Boolean(link);
+  if (activeLink) floatingToolbar.dataset.zcastLinkTarget = 'external';
+  else delete floatingToolbar.dataset.zcastLinkTarget;
+
+  const showOpenWikilink = Boolean(link);
+  const showUnlink = activeLink;
+  const showOpenExternal = collapsed && activeLink;
 
   floatingToolbar.querySelectorAll('[data-zcast-action]').forEach((button) => {
-    if (button.dataset.zcastAction === 'openWikilink') {
-      button.hidden = !showOpen;
-      return;
+    let visible;
+    switch (button.dataset.zcastAction) {
+      case 'openWikilink':
+        visible = showOpenWikilink;
+        break;
+      case 'unlink':
+        visible = showUnlink;
+        break;
+      case 'openExternalLink':
+        visible = showOpenExternal;
+        break;
+      case 'externalLink':
+        visible = !collapsed || activeLink;
+        break;
+      default:
+        visible = !collapsed;
+        break;
     }
-    button.hidden = collapsed;
+    button.hidden = !visible;
   });
 
+  const showOpenSeparator = collapsed ? showOpenWikilink || showOpenExternal : showOpenWikilink;
   floatingToolbar.querySelectorAll('.zcast-toolbar-sep').forEach((separator) => {
     const openSeparator = separator.classList.contains('zcast-toolbar-sep-open');
-    separator.hidden = collapsed || (openSeparator && !showOpen);
+    separator.hidden = openSeparator ? !showOpenSeparator : collapsed;
   });
 }
 
@@ -1963,6 +2407,7 @@ function positionToolbar(toolbar, rect) {
 function syncToolbarState(state) {
   if (!floatingToolbar || !state?.editor) return;
   const editor = state.editor;
+  const insideWikilink = Boolean(toolbarWikilink(state));
 
   const active = {
     bold: editor.isActive('bold'),
@@ -1974,22 +2419,53 @@ function syncToolbarState(state) {
     orderedList: editor.isActive('orderedList'),
     blockquote: editor.isActive('blockquote'),
     code: editor.isActive('code'),
+    externalLink: !insideWikilink && editor.isActive('link'),
   };
 
   floatingToolbar.querySelectorAll('[data-zcast-action]').forEach((button) => {
     const action = button.dataset.zcastAction;
-    if (active[action]) button.dataset.active = 'true';
+    const isActive = Boolean(active[action]);
+
+    if (isActive) button.dataset.active = 'true';
     else delete button.dataset.active;
+
+    if (TOOLBAR_TOGGLES.has(action) || action === 'externalLink') {
+      button.setAttribute('aria-pressed', isActive ? 'true' : 'false');
+    }
   });
+
+  const linkButton = floatingToolbar.querySelector('.zcast-toolbar-link');
+  if (linkButton) {
+    linkButton.classList.toggle('is-active', Boolean(active.externalLink));
+  }
 }
 
 function hideFloatingToolbar() {
-  if (floatingToolbar) floatingToolbar.hidden = true;
+  if (linkBar.open) closeLinkBar({ restore: false, silent: true });
+
+  const form = linkBarForm();
+  if (form) form.hidden = true;
+
+  if (floatingToolbar) {
+    floatingToolbar.hidden = true;
+    floatingToolbar.dataset.mode = 'selection';
+  }
   toolbarOwner = null;
 }
 
 function repositionFloatingToolbar() {
   if (!toolbarOwner || !floatingToolbar || floatingToolbar.hidden) return;
+
+  // The URL bar stays anchored to the link it is editing while it is open.
+  if (linkBar.open) {
+    const { editor } = toolbarOwner;
+    if (editor && linkBar.selection) {
+      const rect = toolbarAnchorRect(editor, linkBar.selection);
+      if (rect) positionToolbar(floatingToolbar, rect);
+    }
+    return;
+  }
+
   // Recompute rather than just reposition: scroll can move a collapsed caret
   // out of its [[wikilink]], and the compact pill must follow it cleanly.
   updateFloatingToolbar(toolbarOwner);
@@ -2587,9 +3063,16 @@ function handleDocumentPaste(event) {
 }
 
 function handleDocumentPointerDown(event) {
+  const element = eventElement(event);
+
+  // Clicking outside the inline URL bar dismisses it without applying.
+  if (linkBar.open) {
+    const insideToolbar = element && floatingToolbar?.contains(element);
+    if (!insideToolbar) closeLinkBar({ restore: false });
+  }
+
   if (!autocomplete.open) return;
 
-  const element = eventElement(event);
   if (autocompleteMenu && element && autocompleteMenu.contains(element)) return;
   if (autocomplete.state?.editor?.view.dom.contains(element)) return;
   hideAutocomplete();

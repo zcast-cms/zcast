@@ -225,4 +225,46 @@ mod tests {
         assert!(editor.get_asset("/editor.css").is_some());
         assert!(editor.get_asset("missing.js").is_none());
     }
+
+    #[test]
+    fn embedded_assets_expose_external_link_toolbar_controls() {
+        let editor = InlineEditor::new();
+
+        let js = editor.get_asset("editor.bundle.js").expect("embedded JS");
+        let js = String::from_utf8_lossy(&js.bytes).into_owned();
+
+        for needle in [
+            "externalLink",
+            "openExternalLink",
+            "zcast-toolbar-link",
+            "zcast-toolbar-unlink",
+            "zcast-toolbar-open-ext",
+            "zcast-toolbar-url-form",
+            "zcast-toolbar-url-input",
+            "Link URL",
+            "noopener,noreferrer",
+        ] {
+            assert!(
+                js.contains(needle),
+                "editor.bundle.js should contain {needle:?}"
+            );
+        }
+
+        // The old prompt-based flow must be gone for good.
+        assert!(!js.contains("window.prompt("));
+
+        let css = editor.get_asset("editor.css").expect("embedded CSS");
+        let css = String::from_utf8_lossy(&css.bytes).into_owned();
+
+        for needle in [
+            ".zcast-toolbar-url-form",
+            ".zcast-toolbar-url-input",
+            ".zcast-toolbar-link",
+            ".zcast-toolbar-unlink",
+            ".zcast-toolbar-open-ext",
+            "data-mode=\"url\"",
+        ] {
+            assert!(css.contains(needle), "editor.css should contain {needle:?}");
+        }
+    }
 }
